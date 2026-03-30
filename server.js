@@ -169,8 +169,19 @@ function getDomainAliases(domainInput = '') {
             aliases.add('Group of Institutions');
             aliases.add('Bluestone Group');
         }
-        // fallback
-        if (aliases.size === 0) {
+        // fallback if this specific item didn't match any triggers
+        let matched = false;
+        if (key.includes('overseas')) matched = true;
+        if (key.includes('ias')) matched = true;
+        if (key.includes('tech')) matched = true;
+        if (key.includes('placement')) matched = true;
+        if (key.includes('sport')) matched = true;
+        if (key.includes('language')) matched = true;
+        if (key.includes('preschool')) matched = true;
+        if (key.includes('startup') || key.includes('business')) matched = true;
+        if (key.includes('group') || key.includes('institution')) matched = true;
+
+        if (!matched) {
             aliases.add(d);
         }
     });
