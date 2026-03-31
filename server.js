@@ -685,6 +685,46 @@ const initDB = async () => {
             )
         `);
 
+         // --- BGOI MOBILE APP TABLES (SAFE INSERT) ---
+        try {
+            await connection.query(`
+                CREATE TABLE IF NOT EXISTS bgoi_enquiries (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT,
+                    lead_code VARCHAR(20),
+                    enquiry_for VARCHAR(255),
+                    candidate_name VARCHAR(255),
+                    full_name VARCHAR(255),
+                    service_type VARCHAR(255),
+                    phone VARCHAR(20),
+                    email VARCHAR(100),
+                    remarks TEXT,
+                    budget VARCHAR(50),
+                    details JSON,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+                )
+            `);
+
+            await connection.query(`
+                CREATE TABLE IF NOT EXISTS bgoi_notifications (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT,
+                    title VARCHAR(255),
+                    message TEXT,
+                    type VARCHAR(50),
+                    is_read TINYINT(1) DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+            `);
+
+            // Add app_user_id to the main leads table for sync tracking
+            await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS app_user_id INT NULL`);
+        } catch (bgoiDbErr) {
+            console.error("Non-critical BGOI Table Error:", bgoiDbErr.message);
+        }
+
         console.log("✅ MySQL Tables Verified and Connected");
         connection.release();
     } catch (err) {
@@ -768,11 +808,14 @@ app.post('/api/contact', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
-// Mobile App Enquiry (Flutter app -> portal leads)
+
+
+// Mobile App Enquiry (Flutter app -> portal leads + BGOI Sync)
 app.post('/api/enquiry', async (req, res) => {
     try {
         const { user_id, enquiry_for, candidate_name, service_type, details } = req.body;
-        // Mobile app sends 'details' as an object (email, phone, message, etc.)
+        const userId = Number(user_id || req.body.app_user_id || req.body.userId) || null;
+
         const name = candidate_name || details?.full_name || 'Mobile User';
         const email = details?.email || '';
         const phone = details?.phone || '';
@@ -780,23 +823,31 @@ app.post('/api/enquiry', async (req, res) => {
         const service = service_type || enquiry_for || 'General';
         const normalizedDomain = normalizeContactDomain(service);
         const leadCode = await getNextLeadCode(normalizedDomain);
+
+        // 1. Insert into BGOI Specific table (Required for your app records)
+        await pool.execute(
+            `INSERT INTO bgoi_enquiries 
+             (user_id, lead_code, enquiry_for, candidate_name, full_name, service_type, phone, email, remarks, budget) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [userId, leadCode, enquiry_for || '', candidate_name || '', name, service, phone, email, message, details?.budget || '']
+        );
+
+        // 2. Insert into Main leads table (Required for CRM Dashboard)
         await pool.execute(
             `INSERT INTO leads
-             (student_name, email, phone, domain, source, category, interested_in, remarks, lead_code, status, is_active)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1)`,
-            [
-                name,
-                email,
-                phone,
-                normalizedDomain,
-                'Mobile App',
-                'Mobile Enquiry',
-                service,
-                message,
-                leadCode
-            ]
+             (student_name, email, phone, domain, source, category, interested_in, remarks, lead_code, status, is_active, app_user_id)
+             VALUES (?, ?, ?, ?, 'Mobile App', 'Mobile Enquiry', ?, ?, ?, 'New', 1, ?)`,
+            [name, email, phone, normalizedDomain, service, message, leadCode, userId]
         );
-        // Trigger notifications/emails
+
+        // 3. Trigger BGOI App Notification
+        if (userId) {
+            await pool.execute(
+                "INSERT INTO bgoi_notifications (user_id, title, message, type) VALUES (?, ?, ?, 'Enquiry')",
+                [userId, "Enquiry Submitted!", `Ref: ${leadCode}`]
+            );
+        }
+
         triggerEmails(name, email, phone, message, normalizedDomain, service, 'Mobile App');
         res.status(201).json({ success: true, message: "Enquiry submitted successfully", lead_code: leadCode });
     } catch (err) {
@@ -804,34 +855,8 @@ app.post('/api/enquiry', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
-// Registration Route (Secured: Only Admins can register new staff)
-app.post('/api/auth/register', authenticateToken, async (req, res) => {
-    const { employee_id, name, email, phone, domain, role, tier, designation, password } = req.body;
 
-    // Security: Only Admins can register new users
-    if (!isAdminUser(req.user)) {
-        return res.status(403).json({ msg: "Access Denied: High-level access required to register staff" });
-    }
 
-    // Security: Regular Admins can ONLY create STAFF tier users
-    if (!isSuperAdminUser(req.user) && tier !== 'STAFF') {
-        return res.status(403).json({ msg: "Admins can only register Staff tier accounts" });
-    }
-
-    console.log('Registering user:', { name, email, phone, domain, role, tier });
-
-    try {
-        const hashedPassword = await bcrypt.hash(password, 10);
-        await pool.execute(
-            'INSERT INTO users (employee_id, name, email, phone, domain, role, tier, designation, password) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            [employee_id || null, name, email, phone, domain, role, tier || 'STAFF', designation || null, hashedPassword]
-        );
-        res.status(201).json({ msg: "User registered successfully" });
-    } catch (err) {
-        console.error("Registration error:", err);
-        res.status(500).json({ error: "Registration failed" });
-    }
-});
 // Login
 app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
@@ -1027,7 +1052,7 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
         } else if (domain && domain !== 'All') {
             addDomainFilter(domain);
         }
-        if (assignedTo && isSuperAdmin) {
+        if (assignedTo && (isSuperAdmin || getUserTier(req.user) === 'ADMIN')) {
             where += " AND assigned_to = ?";
             filters.push(Number(assignedTo));
         }
@@ -1167,22 +1192,27 @@ app.put('/api/leads/:id/status', authenticateToken, async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
-// Update Payment Details (TL + Super Admin roles only)
+// Update Payment Details (Super Admin, Admin, and Staff)
 app.put('/api/leads/:id/payment', authenticateToken, async (req, res) => {
     const { id } = req.params;
     const { payment_status, total_fees, paid_amount } = req.body;
-    if (!isAdminUser(req.user)) {
-        return res.status(403).json({ msg: 'Only admin tier and super admin can update payment details' });
+
+    // Permissions: Allow Super Admin, Admin, Staff
+    if (!isAdminUser(req.user) && !isStaffUser(req.user)) {
+        return res.status(403).json({ msg: 'Only Super Admin, Admin and Staff can update payment details' });
     }
+
     try {
         const [beforeRows] = await pool.execute(
-            'SELECT domain, payment_status, total_fees, paid_amount FROM leads WHERE id = ?',
+            'SELECT domain, payment_status, total_fees, paid_amount, assigned_to, status FROM leads WHERE id = ?',
             [id]
         );
         if (beforeRows.length === 0) return res.status(404).json({ msg: 'Lead not found' });
         const before = beforeRows[0];
-        if (!isSuperAdminUser(req.user) && before.domain !== req.user.domain) {
-            return res.status(403).json({ msg: 'Admin can only update payment for own domain leads' });
+
+        // Security: Ensure user has access to this lead
+        if (!canUserAccessLead(before, req.user)) {
+            return res.status(403).json({ msg: 'Access Denied: You do not have permission to update this lead' });
         }
         const allowedPaymentStatuses = ['Paid', 'Unpaid', 'Partially Paid'];
         const nextPaymentStatus = typeof payment_status === 'string' && payment_status.trim() !== ''
@@ -1204,12 +1234,20 @@ app.put('/api/leads/:id/payment', authenticateToken, async (req, res) => {
         if (nextTotalFees < 0 || nextPaidAmount < 0) {
             return res.status(400).json({ msg: 'Fees and paid amount cannot be negative' });
         }
+        
+        // Auto-Enrollment: Set status to 'Enrolled' when payment is updated
+        const nextStatus = 'Enrolled';
+
         await pool.execute(
-            'UPDATE leads SET payment_status = ?, total_fees = ?, paid_amount = ? WHERE id = ?',
-            [nextPaymentStatus, nextTotalFees, nextPaidAmount, id]
+            'UPDATE leads SET payment_status = ?, total_fees = ?, paid_amount = ?, status = ? WHERE id = ?',
+            [nextPaymentStatus, nextTotalFees, nextPaidAmount, nextStatus, id]
         );
         const changedBy = req.user?.name || 'System';
         const historyRows = [];
+        
+        if (before.status !== nextStatus) {
+            historyRows.push([id, 'STATUS_UPDATE', 'status', before.status || '', nextStatus, changedBy]);
+        }
         if ((before.payment_status || '') !== (nextPaymentStatus || '')) {
             historyRows.push([id, 'PAYMENT_UPDATE', 'payment_status', before.payment_status || '', nextPaymentStatus || '', changedBy]);
         }
@@ -1232,6 +1270,7 @@ app.put('/api/leads/:id/payment', authenticateToken, async (req, res) => {
                 payment_status: nextPaymentStatus,
                 total_fees: nextTotalFees,
                 paid_amount: nextPaidAmount,
+                status: nextStatus
             }
         });
     } catch (err) {
@@ -1252,7 +1291,7 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
         search = '',
         domain = 'All',
         status = 'All',
-        payment_status = 'All',
+        assigned_to = 'All',
         invalid_reason = 'All',
         source = 'All',
         sort_by = 'created_at',
@@ -1304,6 +1343,9 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
         if (isStaff) {
             where += ' AND assigned_to = ?';
             params.push(req.user.id);
+        } else if (assigned_to && assigned_to !== 'All') {
+            where += ' AND assigned_to = ?';
+            params.push(Number(assigned_to));
         }
         if (status && status !== 'All') {
             const statuses = status.split(',').map(s => s.trim());
@@ -1731,6 +1773,7 @@ app.get('/api/leads/domain/:domainName', authenticateToken, async (req, res) => 
         interest = 'All',
         status = 'All',
         search = '',
+        assigned_to = 'All',
         sortBy = 'created_at',
         sortOrder = 'desc'
     } = req.query;
@@ -1749,6 +1792,9 @@ app.get('/api/leads/domain/:domainName', authenticateToken, async (req, res) => 
         if (isStaffUser(req.user)) {
             where += ' AND assigned_to = ?';
             params.push(userId);
+        } else if (assigned_to && assigned_to !== 'All') {
+            where += ' AND assigned_to = ?';
+            params.push(Number(assigned_to));
         }
         // SEARCH
         if (search.trim()) {
