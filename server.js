@@ -46,11 +46,19 @@ const pool = mysql.createPool({
     user: 'u287260207_bgoi_user',
     password: '4g@LMW2026',
     database: 'u287260207_bgoi_bg',
-    connectTimeout: 15000,
+    connectTimeout: 30000,
     waitForConnections: true,
-    connectionLimit: 10,
-    timezone: 'Z'
+    connectionLimit: 5,
+    queueLimit: 50,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 10000,
 });
+
+// Centralized Query Helper to ensure connection reuse
+async function query(sql, params = []) {
+    const [rows] = await pool.execute(sql, params);
+    return rows;
+}
 
 
 // Proactive Error Monitor
@@ -61,12 +69,39 @@ pool.on('error', (err) => {
     }
 });
 
+// --- IST HELPERS (Strictly +05:30) ---
+function getISTDate() {
+    const d = new Date();
+    // Normalize to UTC then add 330 mins
+    const utc = d.getTime() + (d.getTimezoneOffset() * 60000);
+    return new Date(utc + (330 * 60000));
+}
+
+function getISTString() {
+    const d = getISTDate();
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    const hours = String(d.getHours()).padStart(2, '0');
+    const minutes = String(d.getMinutes()).padStart(2, '0');
+    const seconds = String(d.getSeconds()).padStart(2, '0');
+    return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
+function getISTDay() {
+    const d = getISTDate();
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+}
+
 const transporter = nodemailer.createTransport({
     host: "smtp.gmail.com",
     port: 465,
     secure: true,
     auth: {
-        user: "bluestonesoftwaredeveloper@gmail.com",
+        user: "bluestoneocs@gmail.com",
         pass: "pffc oagp umot lssz",
     },
     tls: { rejectUnauthorized: false },
@@ -327,46 +362,56 @@ function canUserAccessLead(lead, user) {
     if (isStaffUser(user)) return Number(lead.assigned_to) === Number(user.id);
     return false;
 }
+
+let lastGlobalCleanupTime = 0;
+const userActivityCache = new Map();
+
 // --- 2. AUTH TRACKING HELPER ---
 async function trackUserActivity(userId) {
     if (!userId) return;
     try {
-        const now = new Date();
-        const today = now.toISOString().split('T')[0];
-        const currentHour = now.getHours();
+        const nowMs = Date.now();
+        const lastUpdate = userActivityCache.get(userId) || 0;
 
-        // 1. Log hourly activity (used for efficiency charts)
-        await pool.execute(`
-            INSERT INTO user_activity_log (user_id, activity_date, activity_hour, active_minutes, last_request_at)
-            VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)
-            ON DUPLICATE KEY UPDATE 
-            active_minutes = CASE 
-                WHEN TIMESTAMPDIFF(MINUTE, last_request_at, CURRENT_TIMESTAMP) > 0 
-                AND TIMESTAMPDIFF(MINUTE, last_request_at, CURRENT_TIMESTAMP) < 10 
-                THEN active_minutes + 1 
-                ELSE active_minutes 
-            END,
-            last_request_at = CURRENT_TIMESTAMP
-        `, [userId, today, currentHour]);
+        // 🔥 Interaction-Based Throttle: Only update DB once every 10 minutes
+        if (nowMs - lastUpdate < 3000000) {
+            return;
+        }
 
-        // 2. Real-time status update for sidebar
-        await pool.execute('UPDATE users SET last_active_at = CURRENT_TIMESTAMP WHERE id = ?', [userId]);
+        userActivityCache.set(userId, nowMs);
+        const today = getISTDay();
+        const currentHour = getISTDate().getHours();
+
+        // 1. Log hourly activity and 2. update real-time status in parallel
+        await Promise.all([
+            pool.execute(`
+                INSERT INTO user_activity_log (user_id, activity_date, activity_hour, active_minutes, last_request_at)
+                VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)
+                ON DUPLICATE KEY UPDATE 
+                active_minutes = CASE 
+                    WHEN TIMESTAMPDIFF(MINUTE, last_request_at, CURRENT_TIMESTAMP) > 0 
+                    AND TIMESTAMPDIFF(MINUTE, last_request_at, CURRENT_TIMESTAMP) < 10 
+                    THEN active_minutes + 1 
+                    ELSE active_minutes 
+                END,
+                last_request_at = CURRENT_TIMESTAMP
+            `, [userId, today, currentHour]),
+            pool.execute('UPDATE users SET last_active_at = CURRENT_TIMESTAMP, iactive = 1 WHERE id = ?', [userId])
+        ]);
 
     } catch (err) {
-        // If we hit connection limits, we log and ignore. 
-        // Failing to track activity should NOT stop users from using the CRM.
-        if (String(err.message).includes('max_connections_per_hour')) {
-            console.warn(`[Activity Tracking] Skipped due to DB connection limits.`);
-        } else {
+        if (!String(err.message).includes('max_connections_per_hour')) {
             console.error(`[Activity Tracking] Error:`, err.message);
         }
     }
-};
+}
 
 // --- AUTH MIDDLEWARE (FIXED) ---
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1]; // Extract token from "Bearer TOKEN"
+    // Fallback to req.body.token for navigator.sendBeacon compatibility
+    const token = (authHeader && authHeader.split(' ')[1]) || req.body?.token;
+
     if (!token) {
         return res.status(401).json({ msg: "Access Denied: No Token Provided" });
     }
@@ -374,363 +419,53 @@ const authenticateToken = (req, res, next) => {
         if (err) {
             return res.status(403).json({ msg: "Invalid or Expired Token" });
         }
-        req.user = decodedUser; // Attach the user data to the request
-
-        // Activity tracking was moved to the /api/auth/ping endpoint
-        // to prevent exceeding database connection limits on every API request.
+        req.user = decodedUser;
         next();
     });
 };
 // --- 3. INITIALIZE TABLES ---
 const initDB = async () => {
+    let connection;
     try {
-        const connection = await pool.getConnection();
+        connection = await pool.getConnection();
+        // Set Session Timezone to IST (+05:30)
+        await connection.query("SET time_zone = '+05:30'");
+
+        // Hostinger optimization: Table verification is retired to save on hourly connection limits.
+        // The core schema is already established and stable.
+
+        // ❌ ENSURE SYSTEM EMAILS TABLE EXISTS
         await connection.query(`
-    CREATE TABLE IF NOT EXISTS master_domains (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        name VARCHAR(255) NOT NULL UNIQUE,
-        sequence INT NULL,
-        icon_type ENUM('default', 'react_icon', 'logo') NOT NULL DEFAULT 'default',
-        icon_name VARCHAR(100) NULL,
-        logo_url MEDIUMTEXT NULL,
-        submenus LONGTEXT NULL
-    )
-`);
-        await connection.query(`ALTER TABLE master_domains ADD COLUMN IF NOT EXISTS sequence INT NULL`);
-        await connection.query(`ALTER TABLE master_domains ADD COLUMN IF NOT EXISTS icon_type ENUM('default', 'react_icon', 'logo') NOT NULL DEFAULT 'default'`);
-        await connection.query(`ALTER TABLE master_domains ADD COLUMN IF NOT EXISTS icon_name VARCHAR(100) NULL`);
-        await connection.query(`ALTER TABLE master_domains ADD COLUMN IF NOT EXISTS logo_url MEDIUMTEXT NULL`);
-        await connection.query(`ALTER TABLE master_domains ADD COLUMN IF NOT EXISTS submenus LONGTEXT NULL`);
-        await connection.query(`
-    CREATE TABLE IF NOT EXISTS master_categories (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        domain_id INT,
-        category_name VARCHAR(255) NOT NULL,
-        FOREIGN KEY (domain_id) REFERENCES master_domains(id) ON DELETE CASCADE
-    )
-`);
-        await connection.query(`
-    CREATE TABLE IF NOT EXISTS master_values (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        category_id INT,
-        sub_value VARCHAR(255) NOT NULL,
-        FOREIGN KEY (category_id) REFERENCES master_categories(id) ON DELETE CASCADE
-    )
-`);
-        await connection.query(`
-    CREATE TABLE IF NOT EXISTS master_user_hierarchy (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        tier ENUM('SUPER_ADMIN','ADMIN','STAFF') NOT NULL,
-        role_name VARCHAR(100) NOT NULL UNIQUE,
-        is_active TINYINT(1) NOT NULL DEFAULT 1,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-`);
-        await connection.query(`ALTER TABLE master_user_hierarchy ADD COLUMN IF NOT EXISTS is_active TINYINT(1) NOT NULL DEFAULT 1`);
-        await connection.query(`
-            CREATE TABLE IF NOT EXISTS users (
+            CREATE TABLE IF NOT EXISTS system_emails (
                 id INT AUTO_INCREMENT PRIMARY KEY,
-                employee_id VARCHAR(50) NULL,
-                name VARCHAR(255) NOT NULL,
-                email VARCHAR(255) NOT NULL UNIQUE,
-                phone VARCHAR(20) NOT NULL,
-                domain VARCHAR(100) NOT NULL,
-                role ENUM('MD', 'GM', 'Main Admin', 'TL', 'Staff') DEFAULT 'Staff',
-                designation VARCHAR(100) NULL,
-                password VARCHAR(255) NOT NULL,
-                avatar MEDIUMTEXT,
-                is_active TINYINT(1) NOT NULL DEFAULT 1,
-                deleted_at DATETIME NULL,
-                deleted_by VARCHAR(255) NULL,
-                last_active_at TIMESTAMP NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        `);
-        await connection.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS tier ENUM('SUPER_ADMIN','ADMIN','STAFF') DEFAULT 'STAFF' AFTER role`);
-        await connection.query(`
-            UPDATE users SET tier = 'SUPER_ADMIN' 
-            WHERE role IN ('Main Admin', 'MD', 'GM', 'Super Admin') AND (tier IS NULL OR tier = 'STAFF')
-        `);
-        await connection.query(`
-            UPDATE users SET tier = 'ADMIN' 
-            WHERE role IN ('TL', 'Coordinator', 'Head', 'Admin') AND (tier IS NULL OR tier = 'STAFF')
-        `);
-        await connection.query(`ALTER TABLE users MODIFY COLUMN deleted_by VARCHAR(255) NULL`);
-        await connection.query(`
-            INSERT IGNORE INTO master_user_hierarchy (tier, role_name, is_active) VALUES
-            ('SUPER_ADMIN', 'Main Admin', 1),
-            ('SUPER_ADMIN', 'MD', 1),
-            ('SUPER_ADMIN', 'GM', 1),
-            ('ADMIN', 'TL', 1),
-            ('ADMIN', 'Coordinator', 1),
-            ('ADMIN', 'Head', 1),
-            ('STAFF', 'Staff', 1)
-        `);
-        await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS interested_in VARCHAR(255)`);
-        await connection.query(`
-    ALTER TABLE leads ADD COLUMN IF NOT EXISTS category VARCHAR(255)
-`);
-        await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS remarks TEXT`);
-        await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS payment_status ENUM('Paid','Unpaid','Partially Paid') DEFAULT 'Unpaid'`);
-        await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS total_fees DECIMAL(12,2) DEFAULT 0`);
-        await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS paid_amount DECIMAL(12,2) DEFAULT 0`);
-        await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS invalid_reason VARCHAR(255)`);
-        await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS lead_code VARCHAR(20) NULL`);
-        await connection.query(`ALTER TABLE leads MODIFY COLUMN status ENUM('New', 'Follow Up', 'Waiting for Confirmation', 'Enrolled', 'Closed') DEFAULT 'New'`);
-        await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS is_active TINYINT(1) NOT NULL DEFAULT 1`);
-        await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS deleted_at DATETIME NULL`);
-        await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS deleted_by VARCHAR(255) NULL`);
-        await connection.query(`ALTER TABLE leads MODIFY COLUMN deleted_by VARCHAR(255) NULL`);
-        await connection.query(`UPDATE leads SET is_active = 1 WHERE is_active IS NULL`);
-
-        await connection.query(`
-            CREATE TABLE IF NOT EXISTS leads (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                student_name VARCHAR(255) NOT NULL,
-                email VARCHAR(255),
-                phone VARCHAR(20) NOT NULL,
-                domain VARCHAR(100) NOT NULL,
-                source VARCHAR(100),
-                category VARCHAR(255),
-                interested_in VARCHAR(255),
-                remarks TEXT,
-                lead_code VARCHAR(20) UNIQUE,
-                payment_status ENUM('Paid', 'Unpaid', 'Partially Paid') DEFAULT 'Unpaid',
-                total_fees DECIMAL(12,2) DEFAULT 0,
-                paid_amount DECIMAL(12,2) DEFAULT 0,
-                invalid_reason VARCHAR(255),
-                is_active TINYINT(1) NOT NULL DEFAULT 1,
-                deleted_at DATETIME NULL,
-                deleted_by VARCHAR(255) NULL,
-                status ENUM('New', 'Follow Up', 'Waiting for Confirmation', 'Enrolled', 'Closed') DEFAULT 'New',
-                assigned_to INT,
-                assigned_to_name VARCHAR(255),
-                assigned_by INT,
-                assigned_by_name VARCHAR(255),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (assigned_to) REFERENCES users(id) ON DELETE SET NULL,
-                FOREIGN KEY (assigned_by) REFERENCES users(id) ON DELETE SET NULL
-            )
+                label VARCHAR(255) NOT NULL,
+                email VARCHAR(255) NOT NULL,
+                is_active TINYINT DEFAULT 1,
+                created_at DATETIME
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         `);
 
-        // Optimize: Only run normalization if there are leads without a lead_code or with legacy prefixes
-        const [missingCodes] = await connection.query(`SELECT COUNT(*) as count FROM leads WHERE lead_code IS NULL OR lead_code = '' OR lead_code = 'PENDING' OR lead_code NOT LIKE 'B%-%'`);
-        const needsNormalization = missingCodes[0].count > 0;
-
-        if (needsNormalization) {
-            console.log(`🚀 Normalizing lead codes for ${missingCodes[0].count} entries...`);
-
-            // Phase 1: assign temporary unique codes in BULK to avoid unique-key collisions
-            // This is MUCH faster than looping for 1000+ rows
-            await connection.query("UPDATE leads SET lead_code = CONCAT('TMP-', id)");
-
-            // Phase 2: assign final codes per prefix in id order
-            const [allLeadRows] = await connection.query(`SELECT id, domain FROM leads ORDER BY id ASC`);
-            const buckets = new Map(); // prefix -> [id]
-            for (const row of allLeadRows) {
-                const prefix = getLeadCodePrefix(row.domain);
-                if (!buckets.has(prefix)) buckets.set(prefix, []);
-                buckets.get(prefix).push(row.id);
-            }
-
-            for (const [prefix, ids] of buckets.entries()) {
-                let seq = 1;
-                for (const id of ids) {
-                    const expectedCode = `${prefix}-${String(seq).padStart(4, '0')}`;
-                    await connection.query('UPDATE leads SET lead_code = ? WHERE id = ?', [expectedCode, id]);
-                    seq += 1;
-                }
-            }
-            console.log(`✅ Normalized lead codes successfully.`);
-        }
-
-        // Create unique index if it doesn't exist
+        // 🚀 PERFORMANCE OPTIMIZATION: Ensure activity_date is indexed to prevent ECONNRESET
         try {
-            await connection.query(`ALTER TABLE leads ADD UNIQUE INDEX idx_leads_lead_code (lead_code)`);
+            await connection.query("CREATE INDEX idx_activity_date ON user_activity_log (activity_date)");
         } catch (e) {
-            const msg = String(e.message || '');
-            if (!msg.includes('Duplicate key name')) {
-                // If there are duplicate lead codes (e.g. from bad old data), just log and move on 
-                // but DON'T let it crash server startup
-                console.warn("⚠️ Could not create unique index on lead_code:", msg);
-            }
-        }
-        // Ensure assigned_by columns exist in existing databases
-        await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS assigned_by INT`);
-        await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS assigned_by_name VARCHAR(255)`);
-
-        await connection.query(`
-            CREATE TABLE IF NOT EXISTS user_activity_log (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id INT NOT NULL,
-                activity_date DATE NOT NULL,
-                activity_hour INT NOT NULL, 
-                active_minutes INT DEFAULT 0,
-                last_request_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                UNIQUE KEY user_date_hour (user_id, activity_date, activity_hour),
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            )
-        `);
-        // Check if the old UNIQUE key exists and remove it if needed (migration)
-        try {
-            await connection.query(`ALTER TABLE user_activity_log DROP INDEX user_date`);
-        } catch (err) { }
-        // Ensure activity_hour column exists for older tables
-        await connection.query(`ALTER TABLE user_activity_log ADD COLUMN IF NOT EXISTS activity_hour INT NOT NULL DEFAULT 0 AFTER activity_date`);
-        // Drop old unique if it was just (user_id, activity_date)
-        try {
-            await connection.query(`ALTER TABLE user_activity_log DROP INDEX user_date`);
-        } catch (err) { }
-        // Update to new unique if not already there
-        try {
-            await connection.query(`ALTER TABLE user_activity_log ADD UNIQUE INDEX idx_user_date_hour (user_id, activity_date, activity_hour)`);
-        } catch (err) { }
-
-        // Create remarks history table
-        await connection.query(`
-            CREATE TABLE IF NOT EXISTS remarks_history (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                lead_id INT NOT NULL,
-                old_remarks TEXT,
-                new_remarks TEXT,
-                changed_by VARCHAR(255),
-                changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE CASCADE
-            )
-        `);
-        await connection.query(`
-            CREATE TABLE IF NOT EXISTS lead_edit_history (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                lead_id INT NOT NULL,
-                action_type VARCHAR(100) NOT NULL,
-                field_name VARCHAR(100),
-                old_value TEXT,
-                new_value TEXT,
-                changed_by VARCHAR(255),
-                changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE CASCADE
-            )
-        `);
-        await connection.query(`
-            CREATE TABLE IF NOT EXISTS user_edit_history (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id INT NOT NULL,
-                action_type VARCHAR(100) NOT NULL,
-                field_name VARCHAR(100),
-                old_value TEXT,
-                new_value TEXT,
-                changed_by VARCHAR(255),
-                changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            )
-        `);
-        await connection.query(`
-            CREATE TABLE IF NOT EXISTS notifications (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                date DATE NOT NULL,
-                message TEXT NOT NULL,
-                is_active TINYINT(1) NOT NULL DEFAULT 1,
-                flag TINYINT(1) NOT NULL DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-            )
-        `);
-        await connection.query(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS is_active TINYINT(1) NOT NULL DEFAULT 1`);
-        await connection.query(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS flag TINYINT(1) NOT NULL DEFAULT 1`);
-        await connection.query(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`);
-        await connection.query(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`);
-        await connection.query(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS created_by VARCHAR(255) DEFAULT NULL`);
-        await connection.query(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS updated_by VARCHAR(255) DEFAULT NULL`);
-        await connection.query(`UPDATE notifications SET is_active = COALESCE(is_active, flag, 1)`);
-        await connection.query(`UPDATE notifications SET flag = COALESCE(flag, is_active, 1)`);
-        await connection.query(`UPDATE notifications SET created_by = COALESCE(NULLIF(created_by, ''), 'System')`);
-        await connection.query(`UPDATE notifications SET updated_by = COALESCE(NULLIF(updated_by, ''), created_by, 'System')`);
-
-        await connection.query(`
-            CREATE TABLE IF NOT EXISTS lead_remarks_messages (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                lead_id INT NOT NULL,
-                ref_id VARCHAR(255),
-                subject VARCHAR(255),
-                description TEXT,
-                recipient_user_ids TEXT,
-                recipient_emails TEXT,
-                candidate_email VARCHAR(255),
-                sent_status VARCHAR(50),
-                sent_error TEXT,
-                created_by VARCHAR(255),
-                attachment_base64 LONGTEXT,
-                attachment_name VARCHAR(255),
-                attachment_type VARCHAR(100),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE CASCADE
-            )
-        `);
-        await connection.query(`
-            CREATE TABLE IF NOT EXISTS lead_remarks_messages_history (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                message_id INT NOT NULL,
-                lead_id INT NOT NULL,
-                ref_id VARCHAR(255),
-                subject VARCHAR(255),
-                description TEXT,
-                attachment_base64 LONGTEXT,
-                attachment_name VARCHAR(255),
-                attachment_type VARCHAR(100),
-                edited_by VARCHAR(255),
-                edited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (message_id) REFERENCES lead_remarks_messages(id) ON DELETE CASCADE,
-                FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE CASCADE
-            )
-        `);
-
-         // --- BGOI MOBILE APP TABLES (SAFE INSERT) ---
-        try {
-            await connection.query(`
-                CREATE TABLE IF NOT EXISTS bgoi_enquiries (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    user_id INT,
-                    lead_code VARCHAR(20),
-                    enquiry_for VARCHAR(255),
-                    candidate_name VARCHAR(255),
-                    full_name VARCHAR(255),
-                    service_type VARCHAR(255),
-                    phone VARCHAR(20),
-                    email VARCHAR(100),
-                    remarks TEXT,
-                    budget VARCHAR(50),
-                    details JSON,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
-                )
-            `);
-
-            await connection.query(`
-                CREATE TABLE IF NOT EXISTS bgoi_notifications (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    user_id INT,
-                    title VARCHAR(255),
-                    message TEXT,
-                    type VARCHAR(50),
-                    is_read TINYINT(1) DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-                )
-            `);
-
-            // Add app_user_id to the main leads table for sync tracking
-            await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS app_user_id INT NULL`);
-        } catch (bgoiDbErr) {
-            console.error("Non-critical BGOI Table Error:", bgoiDbErr.message);
+            // Index existing is fine
         }
 
-        console.log("✅ MySQL Tables Verified and Connected");
-        connection.release();
+        // 🔄 TERMINOLOGY MIGRATION: 
+        // 1. Final payment -> Full payment
+        await connection.query("UPDATE leads SET payment_status = 'Full payment' WHERE payment_status = 'Final Payment'");
+        // 2. Closed -> Invalid (Fixing empty sub-menu table)
+        await connection.query("UPDATE leads SET status = 'Invalid' WHERE status = 'Closed'");
+
+        console.log("✅ Database Connectivity & Core Schema Verified");
     } catch (err) {
-        console.error("❌ Database Init Error:", err.message);
+        console.error("❌ Database Connection Error:", err.message);
+    } finally {
+        if (connection) connection.release();
     }
 };
+
 // Global error handler for body parser limits to return a friendly JSON response
 app.use((err, req, res, next) => {
     if (err && err.type === 'entity.too.large') {
@@ -748,14 +483,15 @@ app.post('/api/contact', async (req, res) => {
         if (!name || !phone || !email) {
             return res.status(400).json({ error: "Missing required fields" });
         }
+        const nowStr = getISTString();
         // New mode: payload from master-driven contact form
         if (domain && category && interested_in) {
             const normalizedDomain = normalizeContactDomain(domain);
             const leadCode = await getNextLeadCode(normalizedDomain);
             await pool.execute(
                 `INSERT INTO leads
-                 (student_name, email, phone, domain, source, category, interested_in, remarks, lead_code, status, is_active)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1)`,
+                 (student_name, email, phone, domain, source, category, interested_in, remarks, lead_code, status, is_active, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1, ?)`,
                 [
                     name,
                     email,
@@ -765,7 +501,8 @@ app.post('/api/contact', async (req, res) => {
                     category,
                     interested_in,
                     message || '',
-                    leadCode
+                    leadCode,
+                    nowStr
                 ]
             );
             triggerEmails(name, email, phone, message, normalizedDomain, interested_in, 'Website Contact');
@@ -786,8 +523,8 @@ app.post('/api/contact', async (req, res) => {
             const leadCode = await getNextLeadCode(domainName);
             await pool.execute(
                 `INSERT INTO leads
-                 (student_name, email, phone, domain, source, category, interested_in, remarks, lead_code, status, is_active)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1)`,
+                 (student_name, email, phone, domain, source, category, interested_in, remarks, lead_code, status, is_active, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1, ?)`,
                 [
                     name,
                     email,
@@ -797,7 +534,8 @@ app.post('/api/contact', async (req, res) => {
                     'Website Enquiry',
                     domainName,
                     message || '',
-                    leadCode
+                    leadCode,
+                    nowStr
                 ]
             );
             triggerEmails(name, email, phone, message, domainName, domainName, 'Website Contact');
@@ -824,27 +562,28 @@ app.post('/api/enquiry', async (req, res) => {
         const normalizedDomain = normalizeContactDomain(service);
         const leadCode = await getNextLeadCode(normalizedDomain);
 
+        const nowStr = getISTString();
         // 1. Insert into BGOI Specific table (Required for your app records)
         await pool.execute(
             `INSERT INTO bgoi_enquiries 
-             (user_id, lead_code, enquiry_for, candidate_name, full_name, service_type, phone, email, remarks, budget) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [userId, leadCode, enquiry_for || '', candidate_name || '', name, service, phone, email, message, details?.budget || '']
+             (user_id, lead_code, enquiry_for, candidate_name, full_name, service_type, phone, email, remarks, budget, created_at) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [userId, leadCode, enquiry_for || '', candidate_name || '', name, service, phone, email, message, details?.budget || '', nowStr]
         );
 
         // 2. Insert into Main leads table (Required for CRM Dashboard)
         await pool.execute(
             `INSERT INTO leads
-             (student_name, email, phone, domain, source, category, interested_in, remarks, lead_code, status, is_active, app_user_id)
-             VALUES (?, ?, ?, ?, 'Mobile App', 'Mobile Enquiry', ?, ?, ?, 'New', 1, ?)`,
-            [name, email, phone, normalizedDomain, service, message, leadCode, userId]
+             (student_name, email, phone, domain, source, category, interested_in, remarks, lead_code, status, is_active, app_user_id, created_at)
+             VALUES (?, ?, ?, ?, 'Mobile App', 'Mobile Enquiry', ?, ?, ?, 'New', 1, ?, ?)`,
+            [name, email, phone, normalizedDomain, service, message, leadCode, userId, nowStr]
         );
 
         // 3. Trigger BGOI App Notification
         if (userId) {
             await pool.execute(
-                "INSERT INTO bgoi_notifications (user_id, title, message, type) VALUES (?, ?, ?, 'Enquiry')",
-                [userId, "Enquiry Submitted!", `Ref: ${leadCode}`]
+                "INSERT INTO bgoi_notifications (user_id, title, message, type, created_at) VALUES (?, ?, ?, 'Enquiry', ?)",
+                [userId, "Enquiry Submitted!", `Ref: ${leadCode}`, nowStr]
             );
         }
 
@@ -901,6 +640,20 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
+// Get current user
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+    try {
+        const [rows] = await pool.execute(
+            'SELECT id, name, email, role, domain, designation, tier FROM users WHERE id = ?',
+            [req.user.id]
+        );
+        if (rows.length === 0) return res.status(404).json({ msg: "User not found" });
+        res.json(rows[0]);
+    } catch (err) {
+        res.status(500).json({ error: "Failed to fetch user" });
+    }
+});
+
 // --- Activity Ping ---
 // Throttled endpoint that frontend calls to keep last_active_at updated without making data requests
 app.post('/api/auth/ping', authenticateToken, (req, res) => {
@@ -911,121 +664,331 @@ app.post('/api/auth/ping', authenticateToken, (req, res) => {
     res.json({ success: true, msg: "Activity recorded" });
 });
 
+// Alias for auth/ping used by the new global heartbeat tracking
+app.post('/api/user/heartbeat', authenticateToken, (req, res) => {
+    if (typeof trackUserActivity === "function") {
+        trackUserActivity(req.user.id);
+    }
+    res.json({ success: true });
+});
+
+// Offline Beacon (used on tab close/logout)
+app.post('/api/user/offline', authenticateToken, async (req, res) => {
+    try {
+        await pool.execute('UPDATE users SET iactive = 0 WHERE id = ?', [req.user.id]);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: "Offline update failed" });
+    }
+});
 // --- NEW: GRANULAR DASHBOARD STATS ---
 app.get('/api/dashboard/stats/:timeframe/:type', authenticateToken, async (req, res) => {
     const { timeframe, type } = req.params;
-    let { domain } = req.query;
-    const { role, domain: userDomain, id: userId } = req.user;
+    let { domain, userId: filterUserId } = req.query;
+    const { role, domain: userDomain, id: loggedUserId } = req.user;
+
     // Security: Only Super Admins can query "All" or other domains
     const isSuperAdmin = isSuperAdminUser(req.user);
     if (!isSuperAdmin) domain = userDomain;
+
     try {
-        let sql = "";
-        let params = [];
-        const combinedBase = `
-            (
-                SELECT student_name, domain, source, created_at, is_active, status, assigned_to
-                FROM leads
-                UNION ALL
-                SELECT candidate_name AS student_name, service_type AS domain, 'Mobile App (Live)' AS source, created_at, 1 AS is_active, 'New' AS status, NULL AS assigned_to
-                FROM bgoi_enquiries e
-                WHERE NOT EXISTS (
+        const isSuperAdmin = isSuperAdminUser(req.user);
+        if (!isSuperAdmin) domain = userDomain;
+
+        let staffFilter = '';
+        let staffParams = [];
+        if (filterUserId && filterUserId !== 'All') {
+            staffFilter = " AND assigned_to = ?";
+            staffParams.push(filterUserId);
+        } else if (isStaffUser(req.user)) {
+            staffFilter = " AND assigned_to = ?";
+            staffParams.push(loggedUserId);
+        }
+
+        // --- 1. LEADS TABLE PART ---
+        let leadsSql = `SELECT status, domain, created_at FROM leads WHERE is_active = 1 ${staffFilter}`;
+        let leadsParams = [...staffParams];
+
+        // --- 2. MOBILE ENQUIRIES PART (Only if status matches 'New' or counting all enquiries) ---
+        let mobileSql = "";
+        let mobileParams = [];
+
+        // Mobile entries only exist for 'enquiry' (all) or 'New' (special case)
+        // If we are looking for 'admission' etc, mobile app doesn't have them yet (they move to leads)
+        if (type === 'enquiry') {
+            mobileSql = `
+                SELECT 'New' AS status, service_type AS domain, created_at 
+                FROM bgoi_enquiries e 
+                WHERE 1=1 
+                AND NOT EXISTS (
                     SELECT 1 FROM leads l 
                     WHERE l.source = 'Mobile App' AND l.student_name = e.candidate_name AND l.created_at = e.created_at
                 )
-            ) AS combined
-        `;
-        // Base Query based on Stat Type
-        if (type === 'enquiry') sql = `SELECT COUNT(*) as count FROM ${combinedBase} WHERE is_active = 1`;
-        else if (type === 'followup') sql = `SELECT COUNT(*) as count FROM ${combinedBase} WHERE is_active = 1 AND status = 'Follow Up'`;
-        else if (type === 'admission') sql = `SELECT COUNT(*) as count FROM ${combinedBase} WHERE is_active = 1 AND status = 'Enrolled'`;
-        else if (type === 'pending') {
-            if (isStaffUser(req.user)) {
-                // Staff pending: their assigned leads with no remarks and not enrolled
-                sql = `SELECT COUNT(*) as count FROM leads WHERE is_active = 1 AND assigned_to = ? AND TRIM(COALESCE(remarks, '')) = '' AND status != 'Enrolled'`;
-                params.push(userId);
-            } else {
-                // TL/Admin pending: either unassigned OR no remarks, and not enrolled
-                sql = `SELECT COUNT(*) as count FROM leads WHERE is_active = 1 AND (assigned_to IS NULL OR TRIM(COALESCE(remarks, '')) = '') AND status != 'Enrolled'`;
+            `;
+            // NOTE: Mobile app enquiries have NO assigned_to yet. 
+            // So if specifically filtering for a Staff user, they are naturally 0.
+            if (staffFilter) mobileSql = ""; // Exclude unassigned mobile enquiries if a staff is selected
+        }
+
+        // Combine into a final counting query
+        let finalSql = "";
+        let finalParams = [];
+
+        if (mobileSql) {
+            finalSql = `SELECT COUNT(*) as count FROM ((${leadsSql}) UNION ALL (${mobileSql})) as combined WHERE 1=1`;
+            finalParams = [...leadsParams, ...mobileParams];
+        } else {
+            finalSql = `SELECT COUNT(*) as count FROM (${leadsSql}) as combined WHERE 1=1`;
+            finalParams = [...leadsParams];
+        }
+
+        // Apply Status Filter
+        if (type === 'followup') finalSql += " AND status = 'Follow Up'";
+        else if (type === 'enrolled') finalSql += " AND status = 'Enrolled'";
+        else if (type === 'pending') finalSql += " AND status = 'Waiting for Confirmation'";
+        else if (type === 'invalid') finalSql += " AND status = 'Invalid'";
+
+        // Apply Domain Filter (Using appendDomainCondition on the combined result)
+        if (domain && domain !== 'All') {
+            finalSql = appendDomainCondition(finalSql, finalParams, domain);
+        } else if (!isSuperAdmin && userDomain) {
+            finalSql = appendDomainCondition(finalSql, finalParams, userDomain);
+        }
+
+        // Apply Timeframe Filter
+        if (timeframe === 'today' || timeframe === 'history') {
+            const { date } = req.query;
+            if (date) {
+                finalSql += " AND DATE(created_at) = ?";
+                finalParams.push(date);
+            } else if (timeframe === 'today') {
+                finalSql += " AND DATE(created_at) = CURDATE()";
+            }
+        } else if (timeframe === 'week') {
+            finalSql += " AND created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)";
+        } else if (timeframe === 'month') {
+            finalSql += " AND created_at >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)";
+        } else if (timeframe === 'year') {
+            finalSql += " AND created_at >= DATE_SUB(CURDATE(), INTERVAL 365 DAY)";
+        } else if (timeframe === 'custom') {
+            const { startDate, endDate } = req.query;
+            if (startDate && endDate) {
+                finalSql += " AND DATE(created_at) BETWEEN ? AND ?";
+                finalParams.push(startDate, endDate);
             }
         }
-        // Restriction: Staff only see their own assignments
-        if (isStaffUser(req.user) && type !== 'pending') {
-            sql += " AND assigned_to = ?";
-            params.push(userId);
-        } else if (domain && domain !== 'All' && type !== 'pending') {
-            sql = appendDomainCondition(sql, params, domain);
-        }
-        // Domain restriction for pending (staff already restricted by assigned_to)
-        if (type === 'pending' && !isStaffUser(req.user) && domain && domain !== 'All') {
-            sql = appendDomainCondition(sql, params, domain);
-        }
-        // Timeframe filter
-        if (timeframe === 'today') sql += " AND DATE(created_at) = CURDATE()";
-        const [rows] = await pool.execute(sql, params);
+
+        const [rows] = await pool.execute(finalSql, finalParams);
         res.json({ count: rows[0].count });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error("Stats API Error:", err);
+        res.status(500).json({ count: 0, error: err.message });
+    }
+});
+
+// --- NEW: BULK DASHBOARD STATS (Consolidates 10 requests into 1) ---
+app.get('/api/dashboard/stats-bulk', authenticateToken, async (req, res) => {
+    let { domain, userId, timeframe, date, startDate, endDate } = req.query;
+    const { domain: userDomain } = req.user;
+    const isSuperAdmin = isSuperAdminUser(req.user);
+    if (!isSuperAdmin) {
+        if (domain && domain !== 'All') {
+            // Validate selected domain is in user's authorized list
+            const authorized = String(userDomain || '').split(',').map(d => d.trim().toLowerCase());
+            if (!authorized.includes(domain.toLowerCase().trim())) {
+                domain = userDomain; // Fallback to full unauthorized list or primary domain
+            }
+        } else {
+            domain = userDomain;
+        }
+    }
+
+    const buildMetricSql = (metricType, periodMode) => {
+        let sql = "SELECT COUNT(*) as count FROM leads WHERE is_active = 1";
+        let params = [];
+
+        // Department/Domain Filter
+        if (domain && domain !== 'All') {
+            sql = appendDomainCondition(sql, params, domain);
+        }
+
+        // Staff/User Filter
+        if (isStaffUser(req.user)) {
+            sql += ' AND assigned_to = ?';
+            params.push(req.user.id);
+        } else if (userId && userId !== 'All') {
+            sql += ' AND assigned_to = ?';
+            params.push(Number(userId));
+        }
+
+        // Metric Type
+        if (metricType === 'followup') sql += " AND status = 'Follow Up'";
+        else if (metricType === 'enrolled') sql += " AND (payment_status IN ('Advance payment', 'Partial Payment', 'Full payment', 'No Fee'))";
+        else if (metricType === 'pending') sql += " AND status = 'Waiting for Confirmation'";
+        else if (metricType === 'invalid') sql += " AND status = 'Invalid'";
+
+        // Timeframe
+        if (periodMode) {
+            if (timeframe === 'today' || (timeframe === 'history' && date)) {
+                sql += " AND DATE(created_at) = ?";
+                params.push(date || new Date().toISOString().split('T')[0]);
+            } else if (timeframe === 'week') {
+                sql += " AND created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)";
+            } else if (timeframe === 'month') {
+                sql += " AND created_at >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)";
+            } else if (timeframe === 'year') {
+                sql += " AND created_at >= DATE_SUB(CURDATE(), INTERVAL 365 DAY)";
+            } else if (timeframe === 'custom' && startDate && endDate) {
+                sql += " AND DATE(created_at) BETWEEN ? AND ?";
+                params.push(startDate, endDate);
+            }
+        }
+        return { sql, params };
+    };
+
+    try {
+        const metrics = [
+            'enquiry', 'followup', 'enrolled', 'pending', 'invalid'
+        ];
+
+        // We run these in parallel on the server but they reuse the connection from the pool
+        const results = await Promise.all([
+            // Totals
+            ...metrics.map(m => {
+                const q = buildMetricSql(m, false);
+                return query(q.sql, q.params);
+            }),
+            // Periods
+            ...metrics.map(m => {
+                const q = buildMetricSql(m, true);
+                return query(q.sql, q.params);
+            })
+        ]);
+
+        res.json({
+            totals: {
+                enquiry: results[0][0].count,
+                followup: results[1][0].count,
+                enrolled: results[2][0].count,
+                pending: results[3][0].count,
+                invalid: results[4][0].count,
+            },
+            periods: {
+                enquiry: results[5][0].count,
+                followup: results[6][0].count,
+                enrolled: results[7][0].count,
+                pending: results[8][0].count,
+                invalid: results[9][0].count,
+            }
+        });
+    } catch (err) {
+        console.error("Bulk Stats Error:", err);
+        res.status(500).json({ error: "Failed to fetch bulk stats" });
     }
 });
 // --- NEW: TODAY & PENDING LEADS LIST ---
 app.get('/api/dashboard/leads-filter', authenticateToken, async (req, res) => {
-    const { role, domain: userDomain, id: userId } = req.user;
-    const { filterType, domain: selectedDomain } = req.query;
+    const { role, domain: userDomain, id: loggedUserId } = req.user;
+    const {
+        filterType,
+        domain: selectedDomain,
+        userId: filterUserId,
+        timeframe = 'today',
+        date,
+        startDate,
+        endDate
+    } = req.query;
+
+    const isSuperAdmin = isSuperAdminUser(req.user);
+
     try {
-        let sql = "SELECT * FROM leads WHERE is_active = 1";
+        // Standardized Base Query to match Stats Cards
+        const combinedBase = `
+            (
+                SELECT id, student_name, email, phone, domain, source, category, interested_in, remarks, lead_code, payment_status, total_fees, paid_amount, invalid_reason, is_active, deleted_at, deleted_by, status, assigned_to, assigned_to_name, assigned_by, assigned_by_name, created_at
+                FROM leads
+                WHERE is_active = 1
+                UNION ALL
+                SELECT e.id, candidate_name AS student_name, e.email, e.phone, service_type AS domain, 'Mobile App (Live)' AS source, 'Mobile Enquiry' AS category, enquiry_for AS interested_in, e.remarks, lead_code, 'Pending payment' AS payment_status, 0 AS total_fees, 0 AS paid_amount, NULL AS invalid_reason, 1 AS is_active, NULL AS deleted_at, NULL AS deleted_by, 'New' AS status, NULL AS assigned_to, NULL AS assigned_to_name, NULL AS assigned_by, NULL AS assigned_by_name, created_at
+                FROM bgoi_enquiries e
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM leads l 
+                    WHERE l.source = 'Mobile App (Live)' AND l.student_name = e.candidate_name AND l.created_at = e.created_at
+                )
+            ) AS combined
+        `;
+
+        let sql = `SELECT * FROM ${combinedBase} WHERE 1=1`;
         let params = [];
-        // --- Domain/Role Security ---
-        const isSuperAdmin = isSuperAdminUser(req.user);
+
+        // --- Apply Filters ---
+
+        // 1. Staff/User Filter
+        if (filterUserId && filterUserId !== 'All') {
+            sql += " AND assigned_to = ?";
+            params.push(filterUserId);
+        } else if (isStaffUser(req.user)) {
+            sql += " AND assigned_to = ?";
+            params.push(loggedUserId);
+        }
+
+        // 2. Domain Filter (Security + Selection)
         if (!isSuperAdmin) {
-            if (isStaffUser(req.user)) {
-                sql += " AND assigned_to = ?";
-                params.push(userId);
-            } else { // ADMIN tier
+            if (selectedDomain && selectedDomain !== 'All') {
+                // Validate selected domain is in user's authorized list
+                const authorized = String(userDomain || '').split(',').map(d => d.trim().toLowerCase());
+                const effectiveDomain = authorized.includes(selectedDomain.toLowerCase().trim()) ? selectedDomain : userDomain;
+                sql = appendDomainCondition(sql, params, effectiveDomain);
+            } else {
                 sql = appendDomainCondition(sql, params, userDomain);
             }
         } else if (selectedDomain && selectedDomain !== 'All') {
             sql = appendDomainCondition(sql, params, selectedDomain);
         }
-        // --- Logic for "Today's Enquiry" ---
-        if (filterType === 'today') {
-            // Include today's leads with or without remarks
-            sql += " AND DATE(created_at) = CURDATE() AND status = 'New'";
+
+        // --- 3. Timeframe filter logic ---
+        if (timeframe === 'today' || timeframe === 'history') {
+            if (date) {
+                sql += " AND DATE(created_at) = ?";
+                params.push(date);
+            } else if (timeframe === 'today') {
+                sql += " AND DATE(created_at) = CURDATE()";
+            }
+        } else if (timeframe === 'week') {
+            sql += " AND created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)";
+        } else if (timeframe === 'month') {
+            sql += " AND created_at >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)";
+        } else if (timeframe === 'year') {
+            sql += " AND created_at >= DATE_SUB(CURDATE(), INTERVAL 365 DAY)";
+        } else if (timeframe === 'custom' && startDate && endDate) {
+            sql += " AND DATE(created_at) BETWEEN ? AND ?";
+            params.push(startDate, endDate);
         }
 
-        // --- Logic for "Pending Tasks" ---
-        else if (filterType === 'pending') {
-            if (isStaffUser(req.user)) {
-                // Staff Pending: Assigned to them but no remarks yet
-                sql += " AND (remarks IS NULL OR remarks = '') AND status != 'Enrolled'";
-            } else {
-                // TL/Admin Pending: Either NOT assigned OR assigned but staff hasn't added remarks
-                sql += " AND (assigned_to IS NULL OR remarks IS NULL OR remarks = '') AND status != 'Enrolled'";
-            }
+        if (filterType === 'today') {
+            sql += " AND status = 'New'";
+        } else if (filterType === 'pending') {
+            sql += " AND status = 'Waiting for Confirmation'";
+        } else if (filterType === 'updated') {
+            sql += " AND status NOT IN ('New', 'Invalid', 'Dropped', 'Waiting for Confirmation')";
+        } else if (filterType === 'invalid') {
+            sql += " AND status = 'Invalid'";
         }
-        // --- Logic for "Today's Enquiry Status" ---
-        else if (filterType === 'updated') {
-            if (isStaffUser(req.user)) {
-                // Staff status table: assigned enquiries that are progressed
-                // (status changed)
-                sql += " AND assigned_to = ? AND status != 'New'";
-                params.push(userId);
-            } else {
-                // TL/Admin status table: same progressed rule across accessible scope
-                sql += " AND status != 'New'";
-            }
-        }
-        sql += " ORDER BY created_at DESC LIMIT 15";
+
+        sql += " ORDER BY created_at DESC";
+        if (filterType !== 'today') sql += " LIMIT 15";
+
         const [rows] = await pool.execute(sql, params);
         res.json(rows);
     } catch (err) {
+        console.error("Dashboard Leads Filter Error:", err);
         res.status(500).json({ error: err.message });
     }
 });
 // Fetch Leads (Used by DomainPage.jsx)
 // Fetch Leads (Used by DomainPage.jsx)
 app.get('/api/leads', authenticateToken, async (req, res) => {
-    const { domain, assignedTo, page = 1, limit = 10 } = req.query;
+    const { domain, assignedTo, view, page = 1, limit = 10 } = req.query;
     const pageNum = parseInt(page, 10) || 1;
     const limitNum = parseInt(limit, 10) || 10;
     const offset = (pageNum - 1) * limitNum;
@@ -1056,11 +1019,27 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
             where += " AND assigned_to = ?";
             filters.push(Number(assignedTo));
         }
+
+        // --- Apply View Filters ---
+        if (view === 'invalid') {
+            where += " AND status = 'Invalid'";
+        } else if (view === 'waiting') {
+            where += " AND status = 'Waiting for Confirmation'";
+        } else if (view === 'dropped') {
+            where += " AND status = 'Dropped'";
+        } else if (view === 'payment') {
+            // Enrolled metrics
+            where += " AND (payment_status IN ('Advance payment', 'Partial Payment', 'Full payment', 'No Fee'))";
+        } else if (view === 'follow-up') {
+            where += " AND status = 'Follow Up'";
+        }
+
         const baseSql = `
             (
                 SELECT 
                     id, student_name, email, phone, domain, source, category, 
                     interested_in, remarks, lead_code, status, is_active, 
+                    payment_status, total_fees, paid_amount,
                     assigned_to, assigned_to_name, assigned_by, assigned_by_name, created_at
                 FROM leads
                 WHERE is_active = 1
@@ -1080,6 +1059,9 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
                     CONCAT('M-', e.id) AS lead_code, 
                     'New' AS status, 
                     1 AS is_active,
+                    'Pending payment' AS payment_status,
+                    0 AS total_fees,
+                    0 AS paid_amount,
                     NULL AS assigned_to, 
                     NULL AS assigned_to_name, 
                     NULL AS assigned_by, 
@@ -1095,7 +1077,10 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
                 )
             ) AS combined
         `;
-        const dataSql = `SELECT * FROM ${baseSql} ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`;
+        const dataSql = `SELECT *, (SELECT subject FROM lead_remarks_messages WHERE lead_id = combined.id ORDER BY created_at DESC, id DESC LIMIT 1) as latest_remark_subject 
+                        FROM ${baseSql} ${where} 
+                        ORDER BY created_at DESC 
+                        LIMIT ? OFFSET ?`;
         const countSql = `SELECT COUNT(*) as total FROM ${baseSql} ${where}`;
         const [rows] = await pool.execute(dataSql, [...filters, limitNum, offset]);
         const [countResult] = await pool.execute(countSql, filters);
@@ -1113,21 +1098,73 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
     }
 });
 // Create Lead (Enquiry Form)
+// Register New Staff
+app.post('/api/auth/register', authenticateToken, async (req, res) => {
+    // Only Admins can register new staff
+    if (!isAdminUser(req.user)) {
+        return res.status(403).json({ msg: "Registration restricted to admins" });
+    }
+
+    const { employee_id, name, email, phone, role, tier, designation, domain, password } = req.body;
+
+    // TIER SECURITY: Regular Admins can only create STAFF tier
+    if (!isSuperAdminUser(req.user) && tier !== 'STAFF') {
+        return res.status(403).json({ msg: "Only Super Admins can create Admin/Super Admin accounts" });
+    }
+
+    try {
+        // 1. Check if user already exists
+        const [existing] = await pool.execute('SELECT id FROM users WHERE email = ?', [email]);
+        if (existing.length > 0) {
+            return res.status(400).json({ msg: "Staff with this email already exists" });
+        }
+
+        // 2. Hash Password
+        const salt = await bcrypt.genSalt(10);
+        const hashedPassword = await bcrypt.hash(password, salt);
+
+        // 3. Save User
+        const nowStr = getISTString();
+        const [result] = await pool.execute(
+            `INSERT INTO users (employee_id, name, email, phone, role, tier, designation, domain, password, is_active, created_at) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+            [employee_id, name, email, phone, role, tier, designation || null, domain, hashedPassword, nowStr]
+        );
+
+        res.status(201).json({ msg: "Staff registered successfully", userId: result.insertId });
+    } catch (err) {
+        console.error("Registration Error:", err);
+        res.status(500).json({ error: "Registration failed", details: err.message });
+    }
+});
+
 app.post('/api/leads', async (req, res) => {
     const { student_name, email, phone, domain, category, source, interested_in, remarks, assigned_to, assigned_to_name, assigned_by, assigned_by_name } = req.body;
     try {
         // ✅ NORMALIZE DOMAIN (CRITICAL FIX)
         const normalizedDomain = normalizeContactDomain(domain);
+
+        // ❌ DUPLICATE CHECK (PHONE + DOMAIN)
+        const [existing] = await pool.execute(
+            'SELECT id, lead_code FROM leads WHERE phone = ? AND domain = ? LIMIT 1',
+            [phone, normalizedDomain]
+        );
+        if (existing.length > 0) {
+            return res.status(409).json({
+                message: `Duplicate Entry: A lead with phone ${phone} already exists in ${normalizedDomain} (Code: ${existing[0].lead_code}).`
+            });
+        }
         const leadCode = await getNextLeadCode(normalizedDomain);
+        const nowStr = getISTString();
         await pool.execute(
             `INSERT INTO leads 
-            (student_name, email, phone, domain, category, source, interested_in, remarks, lead_code, status, is_active, assigned_to, assigned_to_name, assigned_by, assigned_by_name) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1, ?, ?, ?, ?)`,
+            (student_name, email, phone, domain, category, source, interested_in, remarks, lead_code, status, is_active, payment_status, assigned_to, assigned_to_name, assigned_by, assigned_by_name, created_at) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1, 'Pending payment', ?, ?, ?, ?, ?)`,
             [
                 student_name,
                 email,
                 phone,
-                normalizedDomain,   // ✅ FIX HERE
+                normalizedDomain,
                 category,
                 source || 'Dashboard',
                 interested_in,
@@ -1136,7 +1173,8 @@ app.post('/api/leads', async (req, res) => {
                 assigned_to || null,
                 assigned_to_name || null,
                 assigned_by || null,
-                assigned_by_name || null
+                assigned_by_name || null,
+                nowStr
             ]
         );
         // ✅ AUTO-RESPONDER EMAIL
@@ -1181,11 +1219,12 @@ app.put('/api/leads/:id/status', authenticateToken, async (req, res) => {
         const [beforeRows] = await pool.execute('SELECT status FROM leads WHERE id = ?', [id]);
         if (beforeRows.length === 0) return res.status(404).json({ msg: "Lead not found" });
         const oldStatus = beforeRows[0].status;
+        const nowStr = getISTString();
         await pool.execute('UPDATE leads SET status = ? WHERE id = ?', [status, id]);
         await pool.execute(
-            `INSERT INTO lead_edit_history (lead_id, action_type, field_name, old_value, new_value, changed_by)
-             VALUES (?, 'STATUS_UPDATE', 'status', ?, ?, ?)`,
-            [id, oldStatus || '', status || '', changedBy]
+            `INSERT INTO lead_edit_history (lead_id, action_type, field_name, old_value, new_value, changed_by, changed_at)
+             VALUES (?, 'STATUS_UPDATE', 'status', ?, ?, ?, ?)`,
+            [id, oldStatus || '', status || '', changedBy, nowStr]
         );
         res.json({ msg: "Updated" });
     } catch (err) {
@@ -1214,10 +1253,14 @@ app.put('/api/leads/:id/payment', authenticateToken, async (req, res) => {
         if (!canUserAccessLead(before, req.user)) {
             return res.status(403).json({ msg: 'Access Denied: You do not have permission to update this lead' });
         }
-        const allowedPaymentStatuses = ['Paid', 'Unpaid', 'Partially Paid'];
+        const allowedPaymentStatuses = [
+            'Advance payment', 'Partial Payment', 'Full payment', 'No Fee', 'Pending payment',
+            'Partial refund', 'Fully refund', 'No refund', 'Refund pending'
+        ];
         const nextPaymentStatus = typeof payment_status === 'string' && payment_status.trim() !== ''
             ? payment_status.trim()
             : before.payment_status;
+
         if (!allowedPaymentStatuses.includes(nextPaymentStatus)) {
             return res.status(400).json({ msg: 'Invalid payment status value' });
         }
@@ -1234,9 +1277,12 @@ app.put('/api/leads/:id/payment', authenticateToken, async (req, res) => {
         if (nextTotalFees < 0 || nextPaidAmount < 0) {
             return res.status(400).json({ msg: 'Fees and paid amount cannot be negative' });
         }
-        
-        // Auto-Enrollment: Set status to 'Enrolled' when payment is updated
-        const nextStatus = 'Enrolled';
+
+        // Auto-Enrollment: Set status to 'Enrolled' when payment is updated to anything other than 'Pending payment' or Refund statuses
+        const refundStatuses = ['Partial refund', 'Fully refund', 'No refund', 'Refund pending'];
+        const nextStatus = (nextPaymentStatus !== 'Pending payment' && !refundStatuses.includes(nextPaymentStatus))
+            ? 'Enrolled'
+            : before.status;
 
         await pool.execute(
             'UPDATE leads SET payment_status = ?, total_fees = ?, paid_amount = ?, status = ? WHERE id = ?',
@@ -1244,7 +1290,7 @@ app.put('/api/leads/:id/payment', authenticateToken, async (req, res) => {
         );
         const changedBy = req.user?.name || 'System';
         const historyRows = [];
-        
+
         if (before.status !== nextStatus) {
             historyRows.push([id, 'STATUS_UPDATE', 'status', before.status || '', nextStatus, changedBy]);
         }
@@ -1257,11 +1303,12 @@ app.put('/api/leads/:id/payment', authenticateToken, async (req, res) => {
         if (Number(before.paid_amount || 0) !== Number(nextPaidAmount || 0)) {
             historyRows.push([id, 'PAYMENT_UPDATE', 'paid_amount', String(before.paid_amount || 0), String(nextPaidAmount || 0), changedBy]);
         }
+        const nowStr = getISTString();
         for (const h of historyRows) {
             await pool.execute(
-                `INSERT INTO lead_edit_history (lead_id, action_type, field_name, old_value, new_value, changed_by)
-                 VALUES (?, ?, ?, ?, ?, ?)`,
-                h
+                `INSERT INTO lead_edit_history (lead_id, action_type, field_name, old_value, new_value, changed_by, changed_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                [...h, nowStr]
             );
         }
         return res.json({
@@ -1279,8 +1326,6 @@ app.put('/api/leads/:id/payment', authenticateToken, async (req, res) => {
 });
 // Super-admin consolidated leads with advanced filters/sort/pagination
 app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
-    // Both ADMIN and STAFF can access aggregated views.
-    // Frontend controls UI visibility, but backend ensures data security.
     const isSuperAdmin = isSuperAdminUser(req.user);
     const isStaff = isStaffUser(req.user);
 
@@ -1291,11 +1336,16 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
         search = '',
         domain = 'All',
         status = 'All',
+        payment_status = 'All',
         assigned_to = 'All',
         invalid_reason = 'All',
         source = 'All',
         sort_by = 'created_at',
         sort_order = 'desc',
+        today,
+        date,
+        startDate,
+        endDate
     } = req.query;
     const pageNum = Math.max(parseInt(page, 10) || 1, 1);
     const limitNum = Math.max(parseInt(limit, 10) || 10, 1);
@@ -1311,17 +1361,61 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
     };
     const safeSortBy = sortMap[sort_by] || 'created_at';
     const safeSortOrder = String(sort_order).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+
     try {
+        const combinedBase = `
+            (
+                SELECT 
+                    id, student_name, email, phone, domain, source, category, 
+                    interested_in, remarks, lead_code, status, is_active, payment_status, 
+                    total_fees, paid_amount, invalid_reason,
+                    assigned_to, assigned_to_name, assigned_by, assigned_by_name, created_at
+                FROM leads
+                WHERE is_active = 1
+                
+                UNION ALL
+                
+                SELECT 
+                    e.id, 
+                    COALESCE(NULLIF(e.candidate_name, ''), NULLIF(e.full_name, ''), 'Mobile User') AS student_name, 
+                    e.email AS email, 
+                    COALESCE(NULLIF(e.phone, ''), 'M-APP') AS phone, 
+                    e.service_type AS domain, 
+                    'Mobile App (Live)' AS source, 
+                    'Mobile Enquiry' AS category,
+                    e.enquiry_for AS interested_in, 
+                    e.remarks AS remarks, 
+                    CONCAT('M-', e.id) AS lead_code, 
+                    'New' AS status, 
+                    1 AS is_active,
+                    'Pending payment' AS payment_status,
+                    0 AS total_fees,
+                    0 AS paid_amount,
+                    NULL AS invalid_reason,
+                    NULL AS assigned_to, 
+                    NULL AS assigned_to_name, 
+                    NULL AS assigned_by, 
+                    NULL AS assigned_by_name, 
+                    e.created_at
+                FROM bgoi_enquiries e
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM leads l 
+                    WHERE l.source = 'Mobile App (Live)' 
+                      AND l.student_name = e.candidate_name 
+                      AND l.created_at = e.created_at
+                )
+            ) AS combined
+        `;
+
         let where = ' WHERE is_active = 1';
         const params = [];
 
         // 1. Enforce Domain Security for non-SuperAdmins
         if (!isSuperAdmin) {
-            const { domain: userDomains } = req.user; // e.g., "DomainA, DomainB"
+            const { domain: userDomains } = req.user;
             const authorizedAliases = getDomainAliases(userDomains);
 
             if (domain && domain !== 'All') {
-                // If requesting a specific domain, verify user belongs to it
                 const requestedAliases = getDomainAliases(domain);
                 const hasAccess = requestedAliases.every(a => authorizedAliases.includes(a));
                 if (!hasAccess) {
@@ -1329,14 +1423,10 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
                 }
                 where = appendDomainCondition(where, params, domain);
             } else {
-                // "All" view for non-SuperAdmins filters to authorized domains only
                 where = appendDomainCondition(where, params, userDomains);
             }
-        } else {
-            // Super Admin can see anything
-            if (domain && domain !== 'All') {
-                where = appendDomainCondition(where, params, domain);
-            }
+        } else if (domain && domain !== 'All') {
+            where = appendDomainCondition(where, params, domain);
         }
 
         // 2. Enforce Assignment Security for Staff
@@ -1347,6 +1437,8 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
             where += ' AND assigned_to = ?';
             params.push(Number(assigned_to));
         }
+
+        // 3. Additional Filters
         if (status && status !== 'All') {
             const statuses = status.split(',').map(s => s.trim());
             if (statuses.length === 1) {
@@ -1366,9 +1458,22 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
             params.push(invalid_reason);
         }
         if (source && source !== 'All') {
-            where += ' AND source = ?';
-            params.push(source);
+            where += ' AND (source = ? OR source LIKE ?)';
+            params.push(source, `%${source}%`);
         }
+
+        // 4. Date Range Filters
+        if (today === '1') {
+            where += " AND DATE(created_at) = CURDATE()";
+        } else if (date) {
+            where += " AND DATE(created_at) = ?";
+            params.push(date);
+        } else if (startDate && endDate) {
+            where += " AND DATE(created_at) BETWEEN ? AND ?";
+            params.push(startDate, endDate);
+        }
+
+        // 5. Search
         const q = String(search || '').trim();
         if (q) {
             const like = `%${q}%`;
@@ -1377,36 +1482,34 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
                 email LIKE ? OR
                 phone LIKE ? OR
                 domain LIKE ? OR
-                source LIKE ? OR
-                category LIKE ? OR
-                interested_in LIKE ? OR
-                remarks LIKE ? OR
-                assigned_to_name LIKE ? OR
                 lead_code LIKE ? OR
-                CAST(id AS CHAR) LIKE ?
+                status LIKE ?
             )`;
-            params.push(like, like, like, like, like, like, like, like, like, like, like);
+            params.push(like, like, like, like, like, like);
         }
+
+        // 6. View Specifics
         if (view === 'pending') {
-            // Keep this in sync with dashboard "pending" metric for super admins.
-            where += ` AND (assigned_to IS NULL OR TRIM(COALESCE(remarks, '')) = '')
-                       AND status != 'Enrolled'`;
+            where += ` AND (assigned_to IS NULL OR TRIM(COALESCE(remarks, '')) = '') AND status != 'Enrolled'`;
         } else if (view === 'payment') {
-            where += ` AND payment_status IN ('Paid', 'Partially Paid')`;
+            where += ` AND payment_status IN ('Advance payment', 'Partial Payment', 'Full payment', 'No Fee')`;
         } else if (view === 'invalid') {
-            where += ` AND status = 'Closed'`;
+            where += ` AND status = 'Invalid'`;
         }
-        const countSql = `SELECT COUNT(*) AS total FROM leads ${where}`;
+
+        const countSql = `SELECT COUNT(*) AS total FROM ${combinedBase} ${where}`;
         const [countRows] = await pool.execute(countSql, params);
         const total = countRows[0]?.total || 0;
+
         const listSql = `
-            SELECT *
-            FROM leads
+            SELECT *, (SELECT subject FROM lead_remarks_messages WHERE lead_id = combined.id ORDER BY created_at DESC, id DESC LIMIT 1) as latest_remark_subject
+            FROM ${combinedBase}
             ${where}
             ORDER BY ${safeSortBy} ${safeSortOrder}
             LIMIT ? OFFSET ?
         `;
         const [rows] = await pool.execute(listSql, [...params, limitNum, offset]);
+
         return res.json({
             leads: rows,
             total,
@@ -1415,6 +1518,7 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
             totalPages: Math.ceil(total / limitNum) || 1,
         });
     } catch (err) {
+        console.error("BGI Leads API ERROR:", err.message);
         return res.status(500).json({ error: err.message });
     }
 });
@@ -1428,15 +1532,16 @@ app.put('/api/leads/remarks', authenticateToken, async (req, res) => {
         // 1. Update the lead first (The most important part)
         await pool.execute('UPDATE leads SET remarks = ? WHERE id = ?', [remarks || '', leadId]);
         // 2. Try to log history (Wrapped in its own try/catch so it doesn't break the main save)
+        const nowStr = getISTString();
         try {
             await pool.execute(
-                'INSERT INTO remarks_history (lead_id, old_remarks, new_remarks, changed_by) VALUES (?, ?, ?, ?)',
-                [leadId, oldRemarks, remarks || '', userName]
+                'INSERT INTO remarks_history (lead_id, old_remarks, new_remarks, changed_by, changed_at) VALUES (?, ?, ?, ?, ?)',
+                [leadId, oldRemarks, remarks || '', userName, nowStr]
             );
             await pool.execute(
-                `INSERT INTO lead_edit_history (lead_id, action_type, field_name, old_value, new_value, changed_by)
-                 VALUES (?, 'REMARKS_UPDATE', 'remarks', ?, ?, ?)`,
-                [leadId, oldRemarks, remarks || '', userName]
+                `INSERT INTO lead_edit_history (lead_id, action_type, field_name, old_value, new_value, changed_by, changed_at)
+                 VALUES (?, 'REMARKS_UPDATE', 'remarks', ?, ?, ?, ?)`,
+                [leadId, oldRemarks, remarks || '', userName, nowStr]
             );
         } catch (historyErr) {
             console.error("History log failed, but remarks were saved:", historyErr.message);
@@ -1469,11 +1574,11 @@ app.get('/api/dashboard/summary', authenticateToken, async (req, res) => {
     -- Lifetime Stats
     COUNT(*) as total,
     COUNT(CASE WHEN status = 'Follow Up' THEN 1 END) as followUp,
-    COUNT(CASE WHEN status = 'Enrolled' THEN 1 END) as admissions,
+    COUNT(CASE WHEN status = 'Enrolled' THEN 1 END) as enrolled,
     -- Today's Stats
     COUNT(CASE WHEN DATE(created_at) = CURDATE() THEN 1 END) as todayTotal,
     COUNT(CASE WHEN DATE(created_at) = CURDATE() AND status = 'Follow Up' THEN 1 END) as todayFollowUp,
-    COUNT(CASE WHEN DATE(created_at) = CURDATE() AND status = 'Enrolled' THEN 1 END) as todayAdmissions
+    COUNT(CASE WHEN DATE(created_at) = CURDATE() AND status = 'Enrolled' THEN 1 END) as todayEnrolled
     FROM leads WHERE is_active = 1`;
         let params = [];
         let countParams = [];
@@ -1521,7 +1626,7 @@ app.get('/api/tl-list', authenticateToken, async (req, res) => {
             : (!isSuperAdminUser(req.user) ? userDomain : null);
 
         let query = `
-            SELECT u.id, u.name, u.role
+            SELECT u.id, u.name, u.role, u.tier
             FROM users u
             LEFT JOIN master_user_hierarchy h ON h.role_name = u.role
             WHERE u.is_active = 1 
@@ -1558,7 +1663,7 @@ app.get('/api/staff-list', authenticateToken, async (req, res) => {
             : (!isSuperAdminUser(req.user) ? userDomain : null);
 
         let query = `
-            SELECT u.id, u.employee_id, u.name, u.domain
+            SELECT u.id, u.employee_id, u.name, u.domain, u.tier
             FROM users u
             LEFT JOIN master_user_hierarchy h ON h.role_name = u.role
             WHERE u.is_active = 1 AND COALESCE(h.tier, 'STAFF') = 'STAFF'
@@ -1602,10 +1707,11 @@ app.post('/api/leads/assign', authenticateToken, async (req, res) => {
             'UPDATE leads SET assigned_to = ?, assigned_to_name = ?, assigned_by = ?, assigned_by_name = ? WHERE id = ?',
             [staffId, staffName, req.user.id, assignerName, leadId]
         );
+        const nowStr = getISTString();
         await pool.execute(
-            `INSERT INTO lead_edit_history (lead_id, action_type, field_name, old_value, new_value, changed_by)
-             VALUES (?, 'ASSIGNMENT_UPDATE', 'assigned_to_name', ?, ?, ?)`,
-            [leadId, oldAssignedTo, staffName || '', assignerName]
+            `INSERT INTO lead_edit_history (lead_id, action_type, field_name, old_value, new_value, changed_by, changed_at)
+             VALUES (?, 'ASSIGNMENT_UPDATE', 'assigned_to_name', ?, ?, ?, ?)`,
+            [leadId, oldAssignedTo, staffName || '', assignerName, nowStr]
         );
         res.json({ msg: "Lead assigned successfully" });
     } catch (err) {
@@ -1662,7 +1768,8 @@ app.get('/api/search/live', authenticateToken, async (req, res) => {
         let sql = `
             SELECT 
                 id, student_name, domain, phone, email, source, category, interested_in, 
-                status, assigned_to_name, assigned_by_name, remarks, lead_code, created_at
+                status, assigned_to_name, assigned_by_name, remarks, lead_code, created_at,
+                (SELECT subject FROM lead_remarks_messages WHERE lead_id = leads.id ORDER BY created_at DESC, id DESC LIMIT 1) as latest_remark_subject
             FROM leads 
             WHERE is_active = 1 AND (
                 student_name LIKE ? OR
@@ -1709,51 +1816,89 @@ app.post('/api/leads/bulk', authenticateToken, async (req, res) => {
     }
     const connection = await pool.getConnection();
     try {
-        await connection.beginTransaction();
-        const sql = `
-INSERT INTO leads 
-(student_name, email, phone, domain, source, category, interested_in, remarks, lead_code, status, is_active, assigned_to, assigned_to_name, assigned_by, assigned_by_name) 
-VALUES ?
-`;
-        const domainBuckets = {};
+        const skipped = [];
+        const uniqueLeads = [];
+        const seenInFile = new Set();
+
         for (const l of leads) {
-            const d = normalizeContactDomain(String(l.domain || '').trim());
-            if (!domainBuckets[d]) domainBuckets[d] = [];
-            domainBuckets[d].push(l);
-        }
-        const codeMap = new Map();
-        for (const d of Object.keys(domainBuckets)) {
-            let nextCode = await getNextLeadCode(d, connection);
-            let seq = parseInt(String(nextCode).split('-')[1], 10) || 1;
-            const prefix = getLeadCodePrefix(d);
-            for (const item of domainBuckets[d]) {
-                codeMap.set(item, `${prefix}-${String(seq).padStart(4, '0')}`);
-                seq += 1;
+            const normDom = normalizeContactDomain(String(l.domain || '').trim());
+            const phone = String(l.phone || '').trim();
+
+            if (!phone || !normDom) {
+                skipped.push({ name: l.student_name, phone, domain: normDom, reason: "Missing phone or domain" });
+                continue;
             }
+
+            const combo = `${phone}|${normDom}`;
+            if (seenInFile.has(combo)) {
+                skipped.push({ name: l.student_name, phone, domain: normDom, reason: "Duplicate in import file" });
+                continue;
+            }
+            seenInFile.add(combo);
+
+            const [existing] = await pool.execute(
+                'SELECT id FROM leads WHERE phone = ? AND domain = ? LIMIT 1',
+                [phone, normDom]
+            );
+
+            if (existing.length > 0) {
+                skipped.push({ name: l.student_name, phone, domain: normDom, reason: "Already exists in database" });
+                continue;
+            }
+
+            uniqueLeads.push({ ...l, domain: normDom });
         }
 
-        // Transform array of objects into array of arrays for MySQL bulk insert
-        const values = leads.map(l => [
-            l.student_name,
-            l.email,
-            l.phone,
-            normalizeContactDomain(String(l.domain || '').trim()),
-            l.source || 'Bulk Import',
-            l.category,        // ✅ ADD
-            l.interested_in,
-            l.remarks,
-            codeMap.get(l),
-            'New',
-            1,
-            l.assigned_to || null,
-            l.assigned_to_name || null,
-            l.assigned_by || null,
-            l.assigned_by_name || null
-        ]);
+        if (uniqueLeads.length === 0) {
+            return res.json({
+                message: "No new leads to import",
+                count: 0,
+                skippedCount: skipped.length,
+                skipped
+            });
+        }
+
+        await connection.beginTransaction();
+        const nowStr = getISTString();
+
+        // Use a loop or batch query for codes to avoid huge concurrency
+        const values = [];
+        for (const l of uniqueLeads) {
+            const leadCode = await getNextLeadCode(l.domain);
+            values.push([
+                l.student_name,
+                l.email,
+                l.phone,
+                l.domain,
+                l.source || 'Bulk Import',
+                l.category,
+                l.interested_in,
+                l.remarks,
+                leadCode,
+                'New',
+                1,
+                l.assigned_to || null,
+                l.assigned_to_name || null,
+                l.assigned_by || null,
+                l.assigned_by_name || null,
+                nowStr
+            ]);
+        }
+
+        const sql = `
+            INSERT INTO leads 
+            (student_name, email, phone, domain, source, category, interested_in, remarks, lead_code, status, is_active, assigned_to, assigned_to_name, assigned_by, assigned_by_name, created_at) 
+            VALUES ?
+        `;
         await connection.query(sql, [values]);
         await connection.commit();
 
-        res.json({ message: "Bulk import successful", count: values.length });
+        res.json({
+            message: `Imported ${values.length} leads successfully.`,
+            count: values.length,
+            skippedCount: skipped.length,
+            skipped
+        });
     } catch (err) {
         console.error("BULK IMPORT ERROR:", err);
         if (connection && typeof connection.rollback === 'function') {
@@ -1775,7 +1920,11 @@ app.get('/api/leads/domain/:domainName', authenticateToken, async (req, res) => 
         search = '',
         assigned_to = 'All',
         sortBy = 'created_at',
-        sortOrder = 'desc'
+        sortOrder = 'desc',
+        today,
+        date,
+        startDate,
+        endDate
     } = req.query;
     const pageNum = parseInt(page) || 1;
     const limitNum = parseInt(limit) || 10;
@@ -1826,6 +1975,26 @@ app.get('/api/leads/domain/:domainName', authenticateToken, async (req, res) => 
             where += ' AND interested_in = ?';
             params.push(interest);
         }
+        if (req.query.payment_status && req.query.payment_status !== 'All') {
+            const ps = req.query.payment_status;
+            if (ps === 'Advance payment,Partial Payment,Full payment,No Fee' || ps === 'payment') {
+                where += " AND payment_status IN ('Advance payment', 'Partial Payment', 'Full payment', 'No Fee')";
+            } else {
+                where += ' AND payment_status = ?';
+                params.push(ps);
+            }
+        }
+
+        // DATE FILTERS
+        if (today === '1') {
+            where += " AND DATE(created_at) = CURDATE()";
+        } else if (date) {
+            where += " AND DATE(created_at) = ?";
+            params.push(date);
+        } else if (startDate && endDate) {
+            where += " AND DATE(created_at) BETWEEN ? AND ?";
+            params.push(startDate, endDate);
+        }
 
         const validSortBy = [
             'created_at', 'student_name', 'phone', 'email', 'status', 'category', 'interested_in', 'lead_code'
@@ -1836,7 +2005,8 @@ app.get('/api/leads/domain/:domainName', authenticateToken, async (req, res) => 
             params
         );
         const [rows] = await pool.execute(
-            `SELECT * FROM leads
+            `SELECT *, (SELECT subject FROM lead_remarks_messages WHERE lead_id = leads.id ORDER BY created_at DESC, id DESC LIMIT 1) as latest_remark_subject
+             FROM leads
              ${where}
              ORDER BY ${validSortBy} ${validSortOrder}
              LIMIT ? OFFSET ?`,
@@ -1910,11 +2080,12 @@ app.post('/api/leads/bulk-assign', authenticateToken, async (req, res) => {
                 [staffId, staffName, req.user.id, assignerName, leadId]
             );
 
+            const nowStr = getISTString();
             // Add to history
             await connection.execute(
-                `INSERT INTO lead_edit_history (lead_id, action_type, field_name, old_value, new_value, changed_by)
-                 VALUES (?, 'ASSIGNMENT_UPDATE', 'assigned_to_name', ?, ?, ?)`,
-                [leadId, oldAssignedTo, staffName || '', assignerName]
+                `INSERT INTO lead_edit_history (lead_id, action_type, field_name, old_value, new_value, changed_by, changed_at)
+                 VALUES (?, 'ASSIGNMENT_UPDATE', 'assigned_to_name', ?, ?, ?, ?)`,
+                [leadId, oldAssignedTo, staffName || '', assignerName, nowStr]
             );
         }
 
@@ -1950,9 +2121,12 @@ app.get('/api/leads/:id/domain-staff', authenticateToken, async (req, res) => {
              FROM users u
              LEFT JOIN master_user_hierarchy h ON h.role_name = u.role
              WHERE u.is_active = 1
-               AND COALESCE(h.tier, 'STAFF') IN ('STAFF', 'ADMIN')
-               AND (${likeClauses})
-             ORDER BY u.role DESC, u.name ASC`,
+               AND (
+                 (COALESCE(h.tier, 'STAFF') IN ('STAFF', 'ADMIN') AND (${likeClauses}))
+                 OR LOWER(u.role) IN ('main admin', 'md', 'gm', 'super admin')
+                 OR LOWER(u.tier) = 'super_admin'
+               )
+             ORDER BY (LOWER(u.tier) = 'super_admin' OR LOWER(u.role) IN ('main admin', 'md', 'gm', 'super admin')) DESC, u.role DESC, u.name ASC`,
             likeParams
         );
         res.json(rows);
@@ -2023,17 +2197,20 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
         subject,
         description,
         recipientUserIds = [],
+        systemRecipientIds = [],
+        primaryRecipientId = null,
+        includeCandidateBCC = true,
         attachment_base64,
         attachment_name,
         attachment_type
     } = req.body;
     // Safe parse recipient ids
     try {
-        if (typeof recipientUserIds === "string") {
-            recipientUserIds = JSON.parse(recipientUserIds);
-        }
+        if (typeof recipientUserIds === "string") recipientUserIds = JSON.parse(recipientUserIds);
+        if (typeof systemRecipientIds === "string") systemRecipientIds = JSON.parse(systemRecipientIds);
     } catch {
         recipientUserIds = [];
+        systemRecipientIds = [];
     }
     if (!subject || !description) {
         return res.status(400).json({
@@ -2055,7 +2232,8 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
             return res.status(403).json({ msg: "Access denied" });
         }
         const resolvedRefId = lead.lead_code || String(lead.id);
-        // Normalize recipient IDs
+
+        // Normalize internal staff IDs
         const normalizedIds = Array.from(
             new Set(
                 (Array.isArray(recipientUserIds) ? recipientUserIds : [])
@@ -2065,27 +2243,81 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
         );
         let staffRows = [];
         if (normalizedIds.length > 0) {
-            const aliases = getDomainAliases(lead.domain);
             const idPlaceholders = normalizedIds.map(() => "?").join(",");
-            const domainPlaceholders = aliases.map(() => "?").join(",");
+            const domainAliases = getDomainAliases(lead.domain);
+            const domainLikeClauses = domainAliases.map(() => "u.domain LIKE ?").join(" OR ");
+            const domainLikeParams = domainAliases.map((a) => `%${a}%`);
+
             const [rows] = await pool.execute(
-                `SELECT id, name, email, phone, role, domain
-         FROM users
-         WHERE is_active = 1
-         AND role IN ('TL','Staff')
-         AND id IN (${idPlaceholders})
-         AND domain IN (${domainPlaceholders})`,
-                [...normalizedIds, ...aliases]
+                `SELECT u.id, u.name, u.email, u.phone, u.role, u.domain
+          FROM users u
+          LEFT JOIN master_user_hierarchy h ON h.role_name = u.role
+          WHERE u.is_active = 1
+          AND (
+             (COALESCE(h.tier, 'STAFF') IN ('STAFF', 'ADMIN') AND (${domainLikeClauses}))
+             OR u.role = 'Super Admin'
+          )
+          AND u.id IN (${idPlaceholders})`,
+                [...domainLikeParams, ...normalizedIds]
             );
             staffRows = rows;
         }
-        const candidateEmail = String(lead.email || "").trim();
-        const staffEmails = staffRows
-            .map((u) => String(u.email || "").trim())
-            .filter(Boolean);
-        const toEmails = Array.from(
-            new Set([candidateEmail, ...staffEmails].filter(Boolean))
+
+        // --- NEW: FETCH SYSTEM MANAGED EMAILS ---
+        let systemEmails = [];
+        let primaryEmail = null;
+
+        const normSystemIds = Array.from(
+            new Set(
+                (Array.isArray(systemRecipientIds) ? systemRecipientIds : [])
+                    .map((v) => Number(v))
+                    .filter((v) => Number.isInteger(v) && v > 0)
+            )
         );
+
+        // Fetch System Recipients
+        const allSystemIds = [...new Set([
+            ...normSystemIds,
+            ...(primaryRecipientId ? [Number(primaryRecipientId)] : [])
+        ])].filter(v => v > 0);
+
+        if (allSystemIds.length > 0) {
+            const qm = allSystemIds.map(() => "?").join(",");
+            const [sysRows] = await pool.execute(
+                `SELECT id, email FROM system_emails WHERE id IN (${qm}) AND is_active = 1`,
+                allSystemIds
+            );
+
+            sysRows.forEach(r => {
+                if (primaryRecipientId && Number(r.id) === Number(primaryRecipientId)) {
+                    primaryEmail = r.email;
+                } else if (normSystemIds.includes(Number(r.id))) {
+                    systemEmails.push(r.email);
+                }
+            });
+        }
+
+        const staffEmails = staffRows.map(u => u.email).filter(Boolean);
+        const candidateEmail = lead.email;
+        const [superAdmins] = await pool.execute(
+            `SELECT email, name, role FROM users 
+             WHERE (LOWER(role) IN ('main admin', 'md', 'gm', 'super admin') OR LOWER(tier) = 'super_admin') 
+               AND is_active = 1`
+        );
+        const superAdminEmails = superAdmins.map(u => u.email).filter(Boolean);
+
+        const allCCEmails = [...new Set([...staffEmails, ...superAdminEmails, ...systemEmails])];
+
+        const finalTo = primaryEmail || "bluestoneocs@gmail.com";
+        const finalCC = allCCEmails.length > 0 ? allCCEmails.join(",") : null;
+        const finalBCC = includeCandidateBCC && candidateEmail ? candidateEmail : null;
+
+        console.log("--- REMARK EMAIL DEBUG ---");
+        console.log("TO (Dev):", finalTo);
+        console.log("CC (Staff/Admins/SuperAdmin):", finalCC);
+        console.log("BCC (Candidate):", finalBCC);
+        console.log("--------------------------");
+        const createdBy = formatWho(req.user);
         // Email HTML
         const html = `
       <div style="font-family: Arial, sans-serif;">
@@ -2094,6 +2326,7 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
         <p><strong>Candidate:</strong> ${lead.student_name || ""}</p>
         <p><strong>Domain:</strong> ${lead.domain || ""}</p>
         <p><strong>Subject:</strong> ${subject}</p>
+        <p><strong>Sent By:</strong> ${createdBy}</p>
         <p><strong>Description:</strong><br/>
         ${description.replace(/\n/g, "<br/>")}
         </p>
@@ -2101,40 +2334,38 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
     `;
         let sentStatus = "FAILED";
         let sentError = "";
-        if (toEmails.length === 0) {
-            sentError = "No recipient email available";
+        const transporter = createMailTransporter();
+        if (!transporter) {
+            sentError = "SMTP not configured";
         } else {
-            const transporter = createMailTransporter();
-            if (!transporter) {
-                sentError = "SMTP not configured";
-            } else {
-                try {
-                    const mailOptions = {
-                        from: SMTP_CONFIG.from || SMTP_CONFIG.user,
-                        to: toEmails.join(","),
-                        subject: `[Lead ${lead.lead_code || lead.id}] ${subject}`,
-                        html
-                    };
-                    // Attach file if present
-                    if (attachment_base64) {
-                        const base64Data = attachment_base64.split("base64,")[1];
-                        mailOptions.attachments = [
-                            {
-                                filename: attachment_name || "attachment",
-                                content: base64Data,
-                                encoding: "base64",
-                                contentType: attachment_type
-                            }
-                        ];
-                    }
-                    await transporter.sendMail(mailOptions);
-                    sentStatus = "SENT";
-                } catch (mailErr) {
-                    sentError = `Mail send failed: ${mailErr.message}`;
+            try {
+                const mailOptions = {
+                    from: SMTP_CONFIG.from || SMTP_CONFIG.user,
+                    to: finalTo,
+                    cc: finalCC,
+                    bcc: finalBCC,
+                    subject: `[Lead ${lead.lead_code || lead.id}] ${subject}`,
+                    html
+                };
+                // Attach file if present
+                if (attachment_base64) {
+                    const base64Data = attachment_base64.split("base64,")[1];
+                    mailOptions.attachments = [
+                        {
+                            filename: attachment_name || "attachment",
+                            content: base64Data,
+                            encoding: "base64",
+                            contentType: attachment_type
+                        }
+                    ];
                 }
+                await transporter.sendMail(mailOptions);
+                sentStatus = "SENT";
+            } catch (mailErr) {
+                sentError = `Mail send failed: ${mailErr.message}`;
             }
         }
-        const createdBy = formatWho(req.user);
+        const nowStr = getISTString();
         // Save to database
         await pool.execute(
             `INSERT INTO lead_remarks_messages
@@ -2151,9 +2382,10 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
         created_by,
         attachment_base64,
         attachment_name,
-        attachment_type
+        attachment_type,
+        created_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 id,
                 resolvedRefId,
@@ -2167,7 +2399,8 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
                 createdBy,
                 attachment_base64 || null,
                 attachment_name || null,
-                attachment_type || null
+                attachment_type || null,
+                nowStr
             ]
         );
         if (sentStatus !== "SENT") {
@@ -2196,6 +2429,7 @@ app.put('/api/leads/:id/remark-messages/:messageId',
             subject,
             description,
             recipientUserIds = [],
+            includeCandidateBCC = true,
             attachment_base64,
             attachment_name,
             attachment_type
@@ -2224,8 +2458,8 @@ app.put('/api/leads/:id/remark-messages/:messageId',
             await pool.execute(
                 `INSERT INTO lead_remarks_messages_history
     (message_id, lead_id, ref_id, subject, description,
-     attachment_base64, attachment_name, attachment_type, edited_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     attachment_base64, attachment_name, attachment_type, edited_by, edited_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [
                     oldMessage.id,
                     oldMessage.lead_id,
@@ -2235,7 +2469,8 @@ app.put('/api/leads/:id/remark-messages/:messageId',
                     oldMessage.attachment_base64,
                     oldMessage.attachment_name,
                     oldMessage.attachment_type,
-                    formatWho(req.user)
+                    formatWho(req.user),
+                    getISTString()
                 ]
             );
             if (msgRows.length === 0) return res.status(404).json({ msg: 'Message not found' });
@@ -2246,23 +2481,50 @@ app.put('/api/leads/:id/remark-messages/:messageId',
             );
             let staffRows = [];
             if (normalizedIds.length > 0) {
-                const aliases = getDomainAliases(lead.domain);
-                const idPlaceholders = normalizedIds.map(() => '?').join(', ');
-                const domainPlaceholders = aliases.map(() => '?').join(', ');
+                const idPlaceholders = normalizedIds.map(() => "?").join(",");
+                const domainAliases = getDomainAliases(lead.domain);
+                const domainLikeClauses = domainAliases.map(() => "u.domain LIKE ?").join(" OR ");
+                const domainLikeParams = domainAliases.map((a) => `%${a}%`);
+
+                console.log("Searching BCC (Edit) for domain aliases:", domainAliases);
+
                 const [rows] = await pool.execute(
-                    `SELECT id, name, email, phone, role, domain
-                 FROM users
-                 WHERE is_active = 1
-                   AND role IN ('TL', 'Staff')
-                   AND id IN (${idPlaceholders})
-                   AND domain IN (${domainPlaceholders})`,
-                    [...normalizedIds, ...aliases]
+                    `SELECT u.id, u.name, u.email, u.phone, u.role, u.domain
+                 FROM users u
+                 LEFT JOIN master_user_hierarchy h ON h.role_name = u.role
+                 WHERE u.is_active = 1
+                   AND (
+                     (COALESCE(h.tier, 'STAFF') IN ('STAFF', 'ADMIN') AND (${domainLikeClauses}))
+                     OR u.role = 'Super Admin'
+                   )
+                   AND u.id IN (${idPlaceholders})`,
+                    [...domainLikeParams, ...normalizedIds]
                 );
                 staffRows = rows;
+                console.log(`Found ${staffRows.length} valid BCC recipients (Edit)`);
             }
+            const staffEmails = staffRows.map(u => u.email).filter(Boolean);
             const candidateEmail = String(lead.email || '').trim();
-            const staffEmails = staffRows.map((u) => String(u.email || '').trim()).filter(Boolean);
-            const toEmails = Array.from(new Set([candidateEmail, ...staffEmails].filter(Boolean)));
+            const [superAdmins] = await pool.execute(
+                `SELECT email FROM users 
+                 WHERE (LOWER(role) IN ('main admin', 'md', 'gm', 'super admin') OR LOWER(tier) = 'super_admin') 
+                   AND is_active = 1`
+            );
+            const superAdminEmails = superAdmins.map(u => u.email).filter(Boolean);
+            console.log(`Found ${superAdminEmails.length} super admins for CC (Edit):`, superAdminEmails);
+
+            const allCCEmails = [...new Set([...staffEmails, ...superAdminEmails])];
+
+            const finalTo = "bluestoneocs@gmail.com";
+            const finalCC = allCCEmails.length > 0 ? allCCEmails.join(",") : null;
+            const finalBCC = includeCandidateBCC && candidateEmail ? candidateEmail : null;
+
+            console.log("--- REMARK EMAIL EDIT DEBUG ---");
+            console.log("TO (Dev):", finalTo);
+            console.log("CC (Staff/Admins/SuperAdmin):", finalCC);
+            console.log("BCC (Candidate):", finalBCC);
+            console.log("-------------------------------");
+            const createdBy = formatWho(req.user);
             const html = `
             <div style="font-family: Arial, sans-serif; line-height: 1.5;">
                 <h3>Lead Remark Update (Edited)</h3>
@@ -2270,44 +2532,43 @@ app.put('/api/leads/:id/remark-messages/:messageId',
                 <p><strong>Candidate:</strong> ${String(lead.student_name || '')}</p>
                 <p><strong>Domain:</strong> ${String(lead.domain || '')}</p>
                 <p><strong>Subject:</strong> ${String(subject)}</p>
+                <p><strong>Edited & Sent By:</strong> ${createdBy}</p>
                 <p><strong>Description:</strong><br/>${String(description).replace(/\n/g, '<br/>')}</p>
             </div>
         `;
             let sentStatus = 'FAILED';
             let sentError = '';
-            if (toEmails.length === 0) {
-                sentError = 'No recipient email available for candidate/staff';
+            const transporter = createMailTransporter();
+            if (!transporter) {
+                sentError = 'SMTP is not configured on server';
             } else {
-                const transporter = createMailTransporter();
-                if (!transporter) {
-                    sentError = 'SMTP is not configured on server';
-                } else {
-                    try {
-                        const mailOptions = {
-                            from: SMTP_CONFIG.from || SMTP_CONFIG.user,
-                            to: toEmails.join(','),
-                            subject: `[Lead ${lead.lead_code || lead.id}] ${subject}`,
-                            html
-                        };
-                        if (attachment_base64) {
-                            const base64Data = attachment_base64.split("base64,")[1] || attachment_base64;
-                            mailOptions.attachments = [{
-                                filename: attachment_name || "attachment",
-                                content: base64Data,
-                                encoding: "base64",
-                                contentType: attachment_type
-                            }];
-                        }
-                        await transporter.sendMail(mailOptions);
-                        sentStatus = 'SENT';
-                    } catch (mailErr) {
-                        sentError = `Mail send failed: ${mailErr.message}`;
+                try {
+                    const mailOptions = {
+                        from: SMTP_CONFIG.from || SMTP_CONFIG.user,
+                        to: finalTo,
+                        cc: finalCC,
+                        bcc: finalBCC,
+                        subject: `[Lead ${lead.lead_code || lead.id}] ${subject}`,
+                        html
+                    };
+                    if (attachment_base64) {
+                        const base64Data = attachment_base64.split("base64,")[1] || attachment_base64;
+                        mailOptions.attachments = [{
+                            filename: attachment_name || "attachment",
+                            content: base64Data,
+                            encoding: "base64",
+                            contentType: attachment_type
+                        }];
                     }
+                    await transporter.sendMail(mailOptions);
+                    sentStatus = 'SENT';
+                } catch (mailErr) {
+                    sentError = `Mail send failed: ${mailErr.message}`;
                 }
             }
             await pool.execute(
                 `UPDATE lead_remarks_messages
-             SET ref_id = ?, subject = ?, description = ?, recipient_user_ids = ?, recipient_emails = ?, candidate_email = ?, sent_status = ?, sent_error = ?, created_by = ?, attachment_base64 = ?, attachment_name = ?, attachment_type = ?
+             SET ref_id = ?, subject = ?, description = ?, recipient_user_ids = ?, recipient_emails = ?, candidate_email = ?, sent_status = ?, sent_error = ?, created_by = ?, attachment_base64 = ?, attachment_name = ?, attachment_type = ?, updated_at = ?
              WHERE id = ? AND lead_id = ?`,
                 [
                     resolvedRefId,
@@ -2322,6 +2583,7 @@ app.put('/api/leads/:id/remark-messages/:messageId',
                     attachment_base64 || null,
                     attachment_name || null,
                     attachment_type || null,
+                    getISTString(),
                     messageId,
                     id
                 ]
@@ -2406,16 +2668,17 @@ app.post('/api/notifications', authenticateToken, async (req, res) => {
         return res.status(400).json({ error: "Date and message are required" });
     }
     try {
+        const nowStr = getISTString();
         // Always insert a new row, even if same date exists.
         const [result] = await pool.execute(
-            'INSERT INTO notifications (date, message, flag, is_active, created_by, updated_by) VALUES (?, ?, 1, 1, ?, ?)',
-            [date, message, actorName, actorName]
+            'INSERT INTO notifications (date, message, flag, is_active, created_by, updated_by, created_at, updated_at) VALUES (?, ?, 1, 1, ?, ?, ?, ?)',
+            [date, message, actorName, actorName, nowStr, nowStr]
         );
         const newId = result.insertId;
 
         await pool.execute(
-            'INSERT INTO notifications_history (notification_id, action_type, new_message, new_date, new_is_active, changed_by) VALUES (?, ?, ?, ?, ?, ?)',
-            [newId, 'CREATED', message, date, 1, actorName]
+            'INSERT INTO notifications_history (notification_id, action_type, new_message, new_date, new_is_active, changed_by, changed_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            [newId, 'CREATED', message, date, 1, actorName, nowStr]
         );
         res.status(201).json({ msg: "Notification created successfully" });
     } catch (err) {
@@ -2433,15 +2696,16 @@ app.put('/api/notifications/:id', authenticateToken, async (req, res) => {
             return res.status(404).json({ error: "Notification not found" });
         }
         const oldData = oldRows[0];
+        const nowStr = getISTString();
         const [result] = await pool.execute(
             `UPDATE notifications 
-       SET message = ?, date = ?, is_active = ?, updated_by = ?, updated_at = NOW() 
+       SET message = ?, date = ?, is_active = ?, updated_by = ?, updated_at = ? 
        WHERE id = ?`,
-            [message, date, is_active ?? 1, actorName, id]
+            [message, date, is_active ?? 1, actorName, nowStr, id]
         );
         await pool.execute(
-            'INSERT INTO notifications_history (notification_id, action_type, old_message, new_message, old_date, new_date, old_is_active, new_is_active, changed_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            [id, 'UPDATED', oldData.message, message, oldData.date, date, oldData.is_active, is_active ?? 1, actorName]
+            'INSERT INTO notifications_history (notification_id, action_type, old_message, new_message, old_date, new_date, old_is_active, new_is_active, changed_by, changed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [id, 'UPDATED', oldData.message, message, oldData.date, date, oldData.is_active, is_active ?? 1, actorName, nowStr]
         );
         res.json({ success: true, message: "Updated successfully" });
     } catch (err) {
@@ -2463,9 +2727,10 @@ app.delete('/api/notifications/:id', authenticateToken, async (req, res) => {
             return res.status(404).json({ msg: "Notification not found" });
         }
         const actorName = req.user?.name || req.user?.email || "System";
+        const nowStr = getISTString();
         await pool.execute(
-            'INSERT INTO notifications_history (notification_id, action_type, changed_by) VALUES (?, ?, ?)',
-            [id, 'DELETED', actorName]
+            'INSERT INTO notifications_history (notification_id, action_type, changed_by, changed_at) VALUES (?, ?, ?, ?)',
+            [id, 'DELETED', actorName, nowStr]
         );
         res.json({ msg: "Notification archived successfully" });
     } catch (err) {
@@ -2481,15 +2746,16 @@ app.patch('/api/notifications/:id/status', authenticateToken, async (req, res) =
         const [oldRows] = await pool.execute('SELECT is_active FROM notifications WHERE id = ?', [id]);
         if (oldRows.length === 0) return res.status(404).json({ error: "Notification not found" });
         const oldIsActive = oldRows[0].is_active;
+        const nowStr = getISTString();
         await pool.execute(
             `UPDATE notifications 
-       SET is_active = ?, updated_by = ?, updated_at = NOW() 
+       SET is_active = ?, updated_by = ?, updated_at = ? 
        WHERE id = ?`,
-            [is_active, actorName, id]
+            [is_active, actorName, nowStr, id]
         );
         await pool.execute(
-            'INSERT INTO notifications_history (notification_id, action_type, old_is_active, new_is_active, changed_by) VALUES (?, ?, ?, ?, ?)',
-            [id, 'STATUS_TOGGLED', oldIsActive, is_active, actorName]
+            'INSERT INTO notifications_history (notification_id, action_type, old_is_active, new_is_active, changed_by, changed_at) VALUES (?, ?, ?, ?, ?, ?)',
+            [id, 'STATUS_TOGGLED', oldIsActive, is_active, actorName, nowStr]
         );
         res.json({ success: true });
     } catch (err) {
@@ -2697,7 +2963,7 @@ app.post('/api/auth/verify-password', authenticateToken, async (req, res) => {
 app.get('/api/staff-directory', authenticateToken, async (req, res) => {
     try {
         const [rows] = await pool.execute(
-            'SELECT id, employee_id, name, role, designation, domain, phone, email, avatar, is_active, last_active_at, TIMESTAMPDIFF(SECOND, last_active_at, CURRENT_TIMESTAMP) AS seconds_since_active FROM users WHERE deleted_at IS NULL ORDER BY id DESC'
+            'SELECT id, employee_id, name, role, tier, designation, domain, phone, email, avatar, is_active, last_active_at, TIMESTAMPDIFF(SECOND, last_active_at, CURRENT_TIMESTAMP) AS seconds_since_active FROM users WHERE deleted_at IS NULL ORDER BY id DESC'
         );
         if (isSuperAdminUser(req.user)) {
             return res.json(rows);
@@ -2757,15 +3023,16 @@ app.patch('/api/staff/:id/status', authenticateToken, async (req, res) => {
         );
         const changedBy = req.user?.name || 'System';
         await pool.execute(
-            `INSERT INTO user_edit_history (user_id, action_type, field_name, old_value, new_value, changed_by)
-             VALUES (?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO user_edit_history (user_id, action_type, field_name, old_value, new_value, changed_by, changed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
             [
                 id,
                 'USER_STATUS',
                 'is_active',
                 String(before.is_active),
                 String(Number(is_active) ? 1 : 0),
-                changedBy
+                changedBy,
+                getISTString()
             ]
         );
         res.json({ msg: "Staff status updated" });
@@ -2780,7 +3047,7 @@ app.delete('/api/staff/:id', authenticateToken, async (req, res) => {
     if (parseInt(id) === req.user.id) {
         return res.status(400).json({ msg: "You cannot delete your own account." });
     }
-    
+
     // Security: Only Admins can delete
     if (!isAdminUser(req.user)) {
         return res.status(403).json({ msg: "Unauthorized to delete staff." });
@@ -2836,53 +3103,72 @@ app.put('/api/staff/:id', authenticateToken, async (req, res) => {
             if (getUserTier(before) !== 'STAFF') return res.status(403).json({ msg: "Admins can only manage Staff tier accounts" });
             if (tier && tier !== 'STAFF') return res.status(403).json({ msg: "Access Denied: Only Super Admins can elevate account tiers" });
         }
-            // 1. Optional: Check if the new email is already used by another user
-            if (email) {
-                const [existing] = await pool.execute(
-                    'SELECT id FROM users WHERE email = ? AND id != ?',
-                    [email, id]
-                );
-                if (existing.length > 0) {
-                    return res.status(400).json({ msg: "Email is already in use by another staff member" });
-                }
+        // 1. Optional: Check if the new email is already used by another user
+        if (email) {
+            const [existing] = await pool.execute(
+                'SELECT id FROM users WHERE email = ? AND id != ?',
+                [email, id]
+            );
+            if (existing.length > 0) {
+                return res.status(400).json({ msg: "Email is already in use by another staff member" });
             }
-            let query = 'UPDATE users SET employee_id = ?, name = ?, email = ?, phone = ?, role = ?, tier = ?, designation = ?, domain = ?';
-            let params = [employee_id || null, name, email, phone, role, tier || before.tier, designation || null, domain];
-            // 2. Only hash and update password if it's provided
-            if (password && password.trim() !== "") {
-                const salt = await bcrypt.genSalt(10);
-                const hashedPassword = await bcrypt.hash(password, salt);
-                query += ', password = ?';
-                params.push(hashedPassword);
-            }
-            query += ' WHERE id = ? AND is_active = 1';
-            params.push(id);
-            const [result] = await pool.execute(query, params);
+        }
+        let query = 'UPDATE users SET employee_id = ?, name = ?, email = ?, phone = ?, role = ?, tier = ?, designation = ?, domain = ?';
+        let params = [
+            employee_id || null,
+            name,
+            email,
+            phone,
+            role,
+            (tier !== undefined && tier !== null) ? tier : before.tier,
+            designation || null,
+            domain
+        ];
+        // 2. Only hash and update password if it's provided
+        if (password && password.trim() !== "") {
+            const salt = await bcrypt.genSalt(10);
+            const hashedPassword = await bcrypt.hash(password, salt);
+            query += ', password = ?';
+            params.push(hashedPassword);
+        }
+        query += ' WHERE id = ? AND is_active = 1';
+        params.push(id);
+        const [result] = await pool.execute(query, params);
         if (result.affectedRows === 0) {
             return res.status(404).json({ msg: "User not found" });
         }
+
         const changedBy = req.user?.name || 'System';
+        const nowStr = getISTString();
         const historyRows = [];
-        if ((before.employee_id || '') !== (employee_id || '')) historyRows.push([id, 'USER_EDIT', 'employee_id', before.employee_id || '', employee_id || '', changedBy]);
-        if ((before.name || '') !== (name || '')) historyRows.push([id, 'USER_EDIT', 'name', before.name || '', name || '', changedBy]);
-        if ((before.email || '') !== (email || '')) historyRows.push([id, 'USER_EDIT', 'email', before.email || '', email || '', changedBy]);
-        if ((before.phone || '') !== (phone || '')) historyRows.push([id, 'USER_EDIT', 'phone', before.phone || '', phone || '', changedBy]);
-        if ((before.role || '') !== (role || '')) historyRows.push([id, 'USER_EDIT', 'role', before.role || '', role || '', changedBy]);
-        if ((before.tier || '') !== (tier || '')) historyRows.push([id, 'USER_EDIT', 'tier', before.tier || '', tier || '', changedBy]);
-        if ((before.designation || '') !== (designation || '')) historyRows.push([id, 'USER_EDIT', 'designation', before.designation || '', designation || '', changedBy]);
-        if ((before.domain || '') !== (domain || '')) historyRows.push([id, 'USER_EDIT', 'domain', before.domain || '', domain || '', changedBy]);
-        if (password && password.trim() !== "") historyRows.push([id, 'PASSWORD_RESET', 'password', '********', '********', changedBy]);
+
+        // Log changes
+        if ((before.employee_id || '') !== (employee_id || '')) historyRows.push([id, 'USER_EDIT', 'employee_id', before.employee_id || '', employee_id || '', changedBy, nowStr]);
+        if ((before.name || '') !== (name || '')) historyRows.push([id, 'USER_EDIT', 'name', before.name || '', name || '', changedBy, nowStr]);
+        if ((before.email || '') !== (email || '')) historyRows.push([id, 'USER_EDIT', 'email', before.email || '', email || '', changedBy, nowStr]);
+        if ((before.phone || '') !== (phone || '')) historyRows.push([id, 'USER_EDIT', 'phone', before.phone || '', phone || '', changedBy, nowStr]);
+        if ((before.role || '') !== (role || '')) historyRows.push([id, 'USER_EDIT', 'role', before.role || '', role || '', changedBy, nowStr]);
+        if ((before.tier || '') !== (tier || '')) historyRows.push([id, 'USER_EDIT', 'tier', before.tier || '', tier || '', changedBy, nowStr]);
+        if ((before.designation || '') !== (designation || '')) historyRows.push([id, 'USER_EDIT', 'designation', before.designation || '', designation || '', changedBy, nowStr]);
+        if ((before.domain || '') !== (domain || '')) historyRows.push([id, 'USER_EDIT', 'domain', before.domain || '', domain || '', changedBy, nowStr]);
+
+        if (password && password.trim() !== "") historyRows.push([id, 'PASSWORD_RESET', 'password', '********', '********', changedBy, nowStr]);
+
         for (const h of historyRows) {
             await pool.execute(
-                `INSERT INTO user_edit_history (user_id, action_type, field_name, old_value, new_value, changed_by)
-                 VALUES (?, ?, ?, ?, ?, ?)`,
+                `INSERT INTO user_edit_history (user_id, action_type, field_name, old_value, new_value, changed_by, changed_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
                 h
             );
         }
-        res.json({ msg: "Staff updated successfully" });
+
+        // Return the updated data to verify
+        const [rows] = await pool.execute('SELECT id, name, email, phone, role, tier, designation, domain FROM users WHERE id = ?', [id]);
+
+        res.json({ msg: "Staff updated successfully", user: rows[0] });
     } catch (err) {
         console.error("Update Error:", err);
-        res.status(500).json({ error: "Database update failed" });
+        res.status(500).json({ error: "Database update failed: " + err.message });
     }
 });
 // ==========================================
@@ -2984,7 +3270,51 @@ app.delete('/api/master/categories/:id', authenticateToken, async (req, res) => 
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 // ==========================================
-// 3. VALUE ROUTES (Step 3 - Sub-values)
+// 4. SYSTEM EMAIL ROUTES (Managed Mail IDs)
+// ==========================================
+app.get('/api/master/system-emails', authenticateToken, async (req, res) => {
+    try {
+        const [rows] = await pool.execute('SELECT * FROM system_emails ORDER BY label ASC');
+        res.json(rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/master/system-emails', authenticateToken, async (req, res) => {
+    if (!isSuperAdminUser(req.user)) return res.status(403).json({ msg: "Super admin only" });
+    const { label, email } = req.body;
+    if (!label || !email) return res.status(400).json({ msg: "Label and Email are required" });
+    try {
+        const nowStr = getISTString();
+        await pool.execute(
+            'INSERT INTO system_emails (label, email, is_active, created_at) VALUES (?, ?, 1, ?)',
+            [label.trim(), email.trim(), nowStr]
+        );
+        res.json({ msg: "System email added" });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/master/system-emails/:id', authenticateToken, async (req, res) => {
+    if (!isSuperAdminUser(req.user)) return res.status(403).json({ msg: "Super admin only" });
+    const { label, email, is_active } = req.body;
+    try {
+        await pool.execute(
+            'UPDATE system_emails SET label = ?, email = ?, is_active = ? WHERE id = ?',
+            [label.trim(), email.trim(), is_active ?? 1, req.params.id]
+        );
+        res.json({ msg: "System email updated" });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/master/system-emails/:id', authenticateToken, async (req, res) => {
+    if (!isSuperAdminUser(req.user)) return res.status(403).json({ msg: "Super admin only" });
+    try {
+        await pool.execute('DELETE FROM system_emails WHERE id = ?', [req.params.id]);
+        res.json({ msg: "System email deleted" });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ==========================================
+// 5. VALUE ROUTES (Step 3 - Sub-values)
 // ==========================================
 app.post('/api/master/values', authenticateToken, async (req, res) => {
     const { category_id, value } = req.body;
@@ -3250,6 +3580,120 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
         res.status(500).json({ error: "Internal Server Error", details: err.message });
     }
 });
+
+app.get('/api/dashboard/enquiry-trends', authenticateToken, async (req, res) => {
+    const { range = 'week', domain: selectedDomain = 'All', startDate, endDate, date: specificDate, tzOffset } = req.query;
+    const { userId: filterUserId } = req.query;
+    const isSuperAdmin = isSuperAdminUser(req.user);
+    const { domain: userDomain, id: loggedUserId } = req.user;
+
+    try {
+        const combinedBase = `
+            (
+                SELECT domain, status, created_at, assigned_to
+                FROM leads
+                WHERE is_active = 1
+                UNION ALL
+                SELECT service_type AS domain, 'New' AS status, created_at, NULL AS assigned_to
+                FROM bgoi_enquiries e
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM leads l 
+                    WHERE l.source = 'Mobile App (Live)' AND l.student_name = e.candidate_name AND l.created_at = e.created_at
+                )
+            ) AS combined
+        `;
+
+        let where = " WHERE 1=1";
+        const params = [];
+
+        // 1. Staff/User Filter
+        if (filterUserId && filterUserId !== 'All') {
+            where += " AND assigned_to = ?";
+            params.push(filterUserId);
+        } else if (isStaffUser(req.user)) {
+            where += " AND assigned_to = ?";
+            params.push(loggedUserId);
+        }
+
+        // 2. Domain Filter (Security + Selection)
+        if (!isSuperAdmin) {
+            if (selectedDomain && selectedDomain !== 'All') {
+                const authorized = String(userDomain || '').split(',').map(d => d.trim().toLowerCase());
+                const effectiveDomain = authorized.includes(selectedDomain.toLowerCase().trim()) ? selectedDomain : userDomain;
+                where = appendDomainCondition(where, params, effectiveDomain);
+            } else {
+                where = appendDomainCondition(where, params, userDomain);
+            }
+        } else if (selectedDomain && selectedDomain !== 'All') {
+            where = appendDomainCondition(where, params, selectedDomain);
+        }
+
+        // 3. Timeframe Filter & Localization
+        // Offset Calculation: DB is IST (+330 min). Local = IST + ((-tzOffset) - 330)
+        const userTzOffset = parseInt(tzOffset || -330);
+        const shiftMinutes = (-userTzOffset) - 330;
+
+        let groupBy = "DATE(created_at)";
+        let selectLabel = "DATE_FORMAT(created_at, '%Y-%m-%d')";
+
+        if (range === 'day') {
+            groupBy = `HOUR(DATE_ADD(created_at, INTERVAL ${shiftMinutes} MINUTE))`;
+            selectLabel = `HOUR(DATE_ADD(created_at, INTERVAL ${shiftMinutes} MINUTE))`;
+            if (specificDate) {
+                where += " AND DATE(created_at) = ?";
+                params.push(specificDate);
+            } else {
+                where += " AND DATE(created_at) = CURDATE()";
+            }
+        } else if (range === 'week') {
+            where += " AND created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)";
+        } else if (range === 'month') {
+            where += " AND created_at >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)";
+        } else if (range === 'year') {
+            where += " AND created_at >= DATE_SUB(CURDATE(), INTERVAL 365 DAY)";
+        } else if (range === 'custom' && startDate && endDate) {
+            where += " AND DATE(created_at) BETWEEN ? AND ?";
+            params.push(startDate, endDate);
+        }
+
+        const sql = `
+            SELECT 
+                ${selectLabel} as label,
+                COUNT(*) as total,
+                SUM(CASE WHEN status = 'Follow Up' THEN 1 ELSE 0 END) as followup,
+                SUM(CASE WHEN status = 'Enrolled' THEN 1 ELSE 0 END) as enrolled
+            FROM ${combinedBase}
+            ${where}
+            GROUP BY ${groupBy}
+            ORDER BY label ASC
+        `;
+
+        const [rawRows] = await pool.execute(sql, params);
+
+        if (range === 'day') {
+            const filled = [];
+            for (let h = 0; h < 24; h++) {
+                const found = rawRows.find(r => parseInt(r.label) === h);
+                filled.push(found ? found : {
+                    label: h,
+                    enquiry: 0,
+                    invalid: 0,
+                    pending: 0,
+                    followup: 0,
+                    enrolled: 0,
+                    total: 0
+                });
+            }
+            return res.json(filled);
+        }
+
+        res.json(rawRows);
+    } catch (err) {
+        console.error("Enquiry Trends Error:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.get('/api/dashboard/trends-daily', async (req, res) => {
     const { domain } = req.query;
     const isAll = domain === 'All';
@@ -3300,6 +3744,46 @@ app.get('/api/dashboard/trends-daily', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+
+// NEW: GET Staff List for Dashboard Dropdown
+// NEW: GET Staff List for Dashboard Dropdown
+app.get('/api/dashboard/staff-list', authenticateToken, async (req, res) => {
+    const { domain: selectedDomain } = req.query;
+    const isSuperAdmin = isSuperAdminUser(req.user);
+    const { domain: userDomain } = req.user;
+
+    try {
+        let sql = "SELECT id, name, domain, role, tier FROM users WHERE is_active = 1";
+        const params = [];
+
+        if (!isSuperAdmin) {
+            // Non-super-admins see users within their authorized domains
+            const authorized = getDomainAliases(userDomain);
+
+            if (selectedDomain && selectedDomain !== 'All') {
+                const requested = getDomainAliases(selectedDomain);
+                const hasAccess = requested.every(r => authorized.includes(r));
+
+                if (hasAccess) {
+                    sql = appendDomainCondition(sql, params, selectedDomain);
+                } else {
+                    sql = appendDomainCondition(sql, params, userDomain);
+                }
+            } else {
+                sql = appendDomainCondition(sql, params, userDomain);
+            }
+        } else if (selectedDomain && selectedDomain !== 'All') {
+            sql = appendDomainCondition(sql, params, selectedDomain);
+        }
+
+        sql += " ORDER BY name ASC";
+        const [rows] = await pool.execute(sql, params);
+        res.json(rows);
+    } catch (err) {
+        console.error("Staff List Error:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
 // GET User Efficiency (Super Admin Only)
 app.get('/api/admin/user-efficiency', authenticateToken, async (req, res) => {
     if (!isSuperAdminUser(req.user)) {
@@ -3307,17 +3791,22 @@ app.get('/api/admin/user-efficiency', authenticateToken, async (req, res) => {
     }
 
     try {
-        const { userId, date, range = 'week' } = req.query;
+        const { userId, date, range = 'week', tzOffset } = req.query;
+        const userTzOffset = parseInt(tzOffset || -330);
+        const shiftMin = (-userTzOffset) - 330;
 
         // 1. Individual Hourly Breakdown (Used for "View Hourly" drill-down)
         if (userId && date) {
             const sql = `
-                SELECT activity_hour as hour, active_minutes as minutes
+                SELECT 
+                    HOUR(DATE_ADD(CONCAT(activity_date, ' ', activity_hour, ':00:00'), INTERVAL ? MINUTE)) as hour, 
+                    SUM(active_minutes) as minutes
                 FROM user_activity_log
                 WHERE user_id = ? AND activity_date = ?
-                ORDER BY activity_hour ASC
+                GROUP BY HOUR(DATE_ADD(CONCAT(activity_date, ' ', activity_hour, ':00:00'), INTERVAL ? MINUTE))
+                ORDER BY hour ASC
             `;
-            const [rows] = await pool.execute(sql, [userId, date]);
+            const [rows] = await pool.execute(sql, [shiftMin, userId, date, shiftMin]);
 
             const hourlyData = [];
             for (let i = 0; i < 24; i++) {
@@ -3341,16 +3830,16 @@ app.get('/api/admin/user-efficiency', authenticateToken, async (req, res) => {
             sql = `
                 SELECT 
                     u.name as userName,
-                    al.activity_hour as label,
+                    HOUR(DATE_ADD(CONCAT(al.activity_date, ' ', al.activity_hour, ':00:00'), INTERVAL ? MINUTE)) as label,
                     SUM(al.active_minutes) as value
                 FROM users u
                 JOIN user_activity_log al ON u.id = al.user_id
                 WHERE al.activity_date = ? AND u.is_active = 1
                 ${userId ? 'AND u.id = ?' : ''}
-                GROUP BY u.id, al.activity_hour
+                GROUP BY u.id, label
                 ORDER BY label ASC
             `;
-            params = userId ? [targetDate, userId] : [targetDate];
+            params = userId ? [shiftMin, targetDate, userId] : [shiftMin, targetDate];
         } else if (range === 'week') {
             // Aggregation by Day for a specific range or last 7 days
             const whereClause = startDate && endDate
@@ -3401,6 +3890,13 @@ app.get('/api/admin/user-efficiency', authenticateToken, async (req, res) => {
 
         const [chartRows] = await pool.execute(sql, params);
         const dataMap = {};
+        if (range === 'day') {
+            // Pre-fill all 24 hours (0 to 23)
+            for (let i = 0; i < 24; i++) {
+                dataMap[i] = { date: i };
+            }
+        }
+
         chartRows.forEach(row => {
             if (!dataMap[row.label]) {
                 dataMap[row.label] = { date: row.label };
@@ -3413,15 +3909,17 @@ app.get('/api/admin/user-efficiency', authenticateToken, async (req, res) => {
         let totalParams = [];
 
         if (range === 'day' && (date || startDate)) {
-            const targetDate = date || startDate || new Date().toISOString().split('T')[0];
+            const targetDate = date || startDate || getISTDay();
+
             totalsSql = `
-                SELECT u.id, u.name, SUM(al.active_minutes) as totalMinutes, u.domain, 1 as activeDays, u.last_active_at
+                SELECT u.id, u.name, IFNULL(SUM(al.active_minutes), 0) as totalMinutes, u.domain, 1 as activeDays, u.last_active_at, u.iactive,
+                       TIMESTAMPDIFF(SECOND, u.last_active_at, NOW()) as secondsAgo
                 FROM users u
-                JOIN user_activity_log al ON u.id = al.user_id
-                WHERE al.activity_date = ? AND u.is_active = 1
+                LEFT JOIN user_activity_log al ON u.id = al.user_id AND al.activity_date = ?
+                WHERE u.is_active = 1
                 ${userId ? 'AND u.id = ?' : ''}
                 GROUP BY u.id
-                ORDER BY SUM(al.active_minutes) DESC
+                ORDER BY IFNULL(SUM(al.active_minutes), 0) DESC
             `;
             totalParams = userId ? [targetDate, userId] : [targetDate];
         } else {
@@ -3432,13 +3930,14 @@ app.get('/api/admin/user-efficiency', authenticateToken, async (req, res) => {
             const rangeDays = range === 'week' ? 7 : 30;
 
             totalsSql = `
-                SELECT u.id, u.name, SUM(al.active_minutes) as totalMinutes, u.domain, COUNT(DISTINCT al.activity_date) as activeDays, u.last_active_at
+                SELECT u.id, u.name, IFNULL(SUM(al.active_minutes), 0) as totalMinutes, u.domain, COUNT(DISTINCT al.activity_date) as activeDays, u.last_active_at, u.iactive,
+                       TIMESTAMPDIFF(SECOND, u.last_active_at, NOW()) as secondsAgo
                 FROM users u
-                JOIN user_activity_log al ON u.id = al.user_id
-                WHERE ${whereClause} AND u.is_active = 1
+                LEFT JOIN user_activity_log al ON u.id = al.user_id AND ${whereClause}
+                WHERE u.is_active = 1
                 ${userId ? 'AND u.id = ?' : ''}
                 GROUP BY u.id
-                ORDER BY SUM(al.active_minutes) DESC
+                ORDER BY IFNULL(SUM(al.active_minutes), 0) DESC
             `;
 
             if (startDate && endDate) {
@@ -3457,9 +3956,11 @@ app.get('/api/admin/user-efficiency', authenticateToken, async (req, res) => {
                 name: u.name,
                 domain: u.domain,
                 last_active_at: u.last_active_at,
-                totalMinutes: u.totalMinutes,
-                totalHours: parseFloat((u.totalMinutes / 60).toFixed(2)),
-                avgHours: parseFloat((u.totalMinutes / 60 / (u.activeDays || 1)).toFixed(2))
+                iactive: u.iactive,
+                secondsAgo: u.secondsAgo,
+                totalMinutes: u.totalMinutes || 0,
+                totalHours: parseFloat(((u.totalMinutes || 0) / 60).toFixed(2)),
+                avgHours: parseFloat(((u.totalMinutes || 0) / 60 / (u.activeDays || 1)).toFixed(2))
             }))
         });
     } catch (err) {
