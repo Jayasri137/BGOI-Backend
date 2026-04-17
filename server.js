@@ -9,27 +9,43 @@ const fs = require("fs");
 const multer = require("multer");
 const path = require("path");
 const app = express();
-const uploadDir = path.join(__dirname, "uploads/remarks");
-if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir, { recursive: true });
-}
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, "uploads/remarks");
-    },
 
+// Multer Config for Documents
+const docDir = path.join(__dirname, "uploads/documents");
+if (!fs.existsSync(docDir)) {
+    fs.mkdirSync(docDir, { recursive: true });
+}
+const storageDocuments = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, "uploads/documents");
+    },
     filename: (req, file, cb) => {
         const unique = Date.now() + "-" + file.originalname;
         cb(null, unique);
     }
 });
-
-
-const upload = multer({ storage });
+const uploadDocuments = multer({ 
+    storage: storageDocuments,
+    limits: { fileSize: 1024 * 1024 }, // 1 MB
+    fileFilter: (req, file, cb) => {
+        const allowedTypes = [
+            'application/pdf',
+            'image/jpeg',
+            'image/png',
+            'image/webp'
+        ];
+        if (allowedTypes.includes(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error('Invalid file type. Only PDF and images are allowed.'));
+        }
+    }
+});
 // Increase limits to handle Base64 images
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(cors());
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 const JWT_SECRET = 'bg_secret_2026';
 // SMTP config (direct code config, no .env)
 const SMTP_CONFIG = {
@@ -373,8 +389,8 @@ async function trackUserActivity(userId) {
         const nowMs = Date.now();
         const lastUpdate = userActivityCache.get(userId) || 0;
 
-        // 🔥 Interaction-Based Throttle: Only update DB once every 10 minutes
-        if (nowMs - lastUpdate < 3000000) {
+        // 🔥 Interaction-Based Throttle: Only update DB once every 60 seconds
+        if (nowMs - lastUpdate < 60000) {
             return;
         }
 
@@ -635,6 +651,10 @@ app.post('/api/auth/login', async (req, res) => {
                 tier: user.tier || tier
             }
         });
+
+        // 🚀 Mark user as ONLINE immediately
+        trackUserActivity(user.id);
+
     } catch (err) {
         res.status(500).json({ error: "Login failed" });
     }
@@ -970,7 +990,7 @@ app.get('/api/dashboard/leads-filter', authenticateToken, async (req, res) => {
         } else if (filterType === 'pending') {
             sql += " AND status = 'Waiting for Confirmation'";
         } else if (filterType === 'updated') {
-            sql += " AND status NOT IN ('New', 'Invalid', 'Dropped', 'Waiting for Confirmation')";
+            sql += " AND status != 'New'";
         } else if (filterType === 'invalid') {
             sql += " AND status = 'Invalid'";
         }
@@ -1483,9 +1503,11 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
                 phone LIKE ? OR
                 domain LIKE ? OR
                 lead_code LIKE ? OR
-                status LIKE ?
+                status LIKE ? OR
+                remarks LIKE ? OR
+                source LIKE ?
             )`;
-            params.push(like, like, like, like, like, like);
+            params.push(like, like, like, like, like, like, like, like);
         }
 
         // 6. View Specifics
@@ -1952,9 +1974,11 @@ app.get('/api/leads/domain/:domainName', authenticateToken, async (req, res) => 
                 student_name LIKE ? OR
                 phone LIKE ? OR
                 email LIKE ? OR
-                lead_code LIKE ?
+                lead_code LIKE ? OR
+                remarks LIKE ? OR
+                source LIKE ?
             )`;
-            params.push(like, like, like, like);
+            params.push(like, like, like, like, like, like);
         }
         // FILTERS
         if (status !== 'All') {
@@ -3542,6 +3566,234 @@ app.get('/api/admin/deleted-leads', authenticateToken, async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+
+// ==========================================
+// DOCUMENT MANAGEMENT SYSTEM
+// ==========================================
+
+// 1. MASTER DOCUMENT REQUIREMENTS
+app.get('/api/master/documents/:level/:parentId', authenticateToken, async (req, res) => {
+    const { level, parentId } = req.params;
+    try {
+        const [rows] = await pool.execute(
+            'SELECT * FROM master_document_requirements WHERE level = ? AND parent_id = ? ORDER BY document_name ASC',
+            [level, parentId]
+        );
+        res.json(rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/master/documents', authenticateToken, async (req, res) => {
+    if (!isAdminUser(req.user)) return res.status(403).json({ msg: "Admin only" });
+    const { level, parentId, documentName, isMandatory } = req.body;
+    try {
+        await pool.execute(
+            'INSERT INTO master_document_requirements (level, parent_id, document_name, is_mandatory) VALUES (?, ?, ?, ?)',
+            [level, parentId, documentName, isMandatory ? 1 : 0]
+        );
+        res.json({ msg: "Document requirement added" });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/master/documents/:id', authenticateToken, async (req, res) => {
+    if (!isAdminUser(req.user)) return res.status(403).json({ msg: "Admin only" });
+    try {
+        await pool.execute('DELETE FROM master_document_requirements WHERE id = ?', [req.params.id]);
+        res.json({ msg: "Document requirement deleted" });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 2. LEAD DOCUMENTS management
+app.get('/api/leads/:id/documents', authenticateToken, async (req, res) => {
+    try {
+        const [rows] = await pool.execute(
+            'SELECT * FROM lead_documents WHERE lead_id = ? ORDER BY uploaded_at DESC',
+            [req.params.id]
+        );
+        res.json(rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/leads/:id/document-requirements', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    try {
+        // 1. Get lead details
+        const [leadRows] = await pool.execute(
+            'SELECT domain, category, interested_in FROM leads WHERE id = ?',
+            [id]
+        );
+        if (leadRows.length === 0) return res.status(404).json({ msg: "Lead not found" });
+        const lead = leadRows[0];
+
+        // 2. Resolve IDs for each level using flexible matching
+        const normalizedDomain = normalizeContactDomain(lead.domain);
+
+        // Domain ID
+        const [domainRows] = await pool.execute(
+            'SELECT id FROM master_domains WHERE LOWER(name) LIKE LOWER(?) OR LOWER(?) LIKE CONCAT("%", LOWER(name), "%")', 
+            [`%${normalizedDomain}%`, normalizedDomain]
+        );
+        const domainId = domainRows[0]?.id;
+
+        // Category ID
+        let categoryId = null;
+        if (lead.category && lead.category !== 'Mobile Enquiry') {
+            const [catRows] = await pool.execute(
+                'SELECT id FROM master_categories WHERE LOWER(category_name) LIKE LOWER(?) OR LOWER(?) LIKE CONCAT("%", LOWER(category_name), "%")', 
+                [`%${lead.category}%`, lead.category]
+            );
+            categoryId = catRows[0]?.id;
+        }
+
+        // Value ID (Interested In)
+        let valueId = null;
+        if (lead.interested_in) {
+            const [valRows] = await pool.execute(
+                'SELECT id FROM master_values WHERE LOWER(sub_value) LIKE LOWER(?) OR LOWER(?) LIKE CONCAT("%", LOWER(sub_value), "%")', 
+                [`%${lead.interested_in}%`, lead.interested_in]
+            );
+            valueId = valRows[0]?.id;
+        }
+
+        console.log(`[DocMatch] Lead ${id}: Domain(${lead.domain} -> ${normalizedDomain} -> ID:${domainId}), Cat(${lead.category} -> ID:${categoryId}), Val(${lead.interested_in} -> ID:${valueId})`);
+
+        // 3. Fetch all requirements for these IDs
+        const parentIds = [
+            { level: 'domain', id: domainId },
+            { level: 'category', id: categoryId },
+            { level: 'value', id: valueId }
+        ].filter(p => p.id);
+
+        let requirements = [];
+        if (parentIds.length > 0) {
+            const placeholders = parentIds.map(() => '(level = ? AND parent_id = ?)').join(' OR ');
+            const params = parentIds.flatMap(p => [p.level, p.id]);
+            const [reqRows] = await pool.execute(
+                `SELECT * FROM master_document_requirements WHERE ${placeholders}`,
+                params
+            );
+            requirements = reqRows;
+        }
+
+        // 4. Fetch already uploaded documents for this lead
+        const [uploadRows] = await pool.execute(
+            'SELECT * FROM lead_documents WHERE lead_id = ?',
+            [id]
+        );
+
+        res.json({
+            requirements,
+            uploads: uploadRows
+        });
+    } catch (err) {
+        console.error("DocReq Error:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/leads/:id/documents/upload', authenticateToken, uploadDocuments.single('file'), async (req, res) => {
+    const { id } = req.params;
+    const { documentName, requirementId } = req.body;
+    const uploadedBy = formatWho(req.user);
+
+    if (!req.file) return res.status(400).json({ msg: "No file uploaded" });
+
+    try {
+        const filePath = `uploads/documents/${req.file.filename}`;
+        
+        // We use an UPSERT style logic: if requirementId exists for this lead, update it.
+        // If no requirementId (ad-hoc), we always insert.
+        if (requirementId) {
+            const [existing] = await pool.execute(
+                'SELECT id FROM lead_documents WHERE lead_id = ? AND requirement_id = ?',
+                [id, requirementId]
+            );
+            
+            if (existing.length > 0) {
+                await pool.execute(
+                    `UPDATE lead_documents 
+                     SET file_name = ?, file_path = ?, file_type = ?, status = 'Uploaded', 
+                         uploaded_by = ?, uploaded_at = NOW() 
+                     WHERE id = ?`,
+                    [req.file.originalname, filePath, req.file.mimetype, uploadedBy, existing[0].id]
+                );
+                return res.json({ msg: "File updated successfully", filePath });
+            }
+        }
+
+        await pool.execute(
+            `INSERT INTO lead_documents 
+            (lead_id, requirement_id, document_name, file_name, file_path, file_type, status, uploaded_by, uploaded_at) 
+            VALUES (?, ?, ?, ?, ?, ?, 'Uploaded', ?, NOW())`,
+            [id, requirementId || null, documentName, req.file.originalname, filePath, req.file.mimetype, uploadedBy]
+        );
+        res.json({ msg: "File uploaded successfully", filePath });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/leads/:id/documents/checklist', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const { requirementId, documentName } = req.body;
+    const uploadedBy = formatWho(req.user);
+
+    if (!requirementId) return res.status(400).json({ msg: "Requirement ID is required for checklist" });
+
+    try {
+        const [existing] = await pool.execute(
+            'SELECT id, status, file_path FROM lead_documents WHERE lead_id = ? AND requirement_id = ?',
+            [id, requirementId]
+        );
+
+        if (existing.length > 0) {
+            // Already there. If it's just 'Collected', we toggle it OFF (delete).
+            // If it has a file, we don't allow unchecking via checklist logic (must delete file).
+            if (existing[0].status === 'Collected') {
+                await pool.execute('DELETE FROM lead_documents WHERE id = ?', [existing[0].id]);
+                return res.json({ msg: "Document unchecked", action: 'removed' });
+            } else {
+                return res.json({ msg: "Document already uploaded", action: 'none' });
+            }
+        }
+
+        // Not there, create a 'Collected' record
+        await pool.execute(
+            `INSERT INTO lead_documents 
+            (lead_id, requirement_id, document_name, status, uploaded_by, uploaded_at) 
+            VALUES (?, ?, ?, 'Collected', ?, NOW())`,
+            [id, requirementId, documentName, uploadedBy]
+        );
+        res.json({ msg: "Document marked as Collected", action: 'added' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/leads/:id/documents/:docId/status', authenticateToken, async (req, res) => {
+    const { docId } = req.params;
+    const { status } = req.body;
+    const identifier = formatWho(req.user);
+    if (!['Pending', 'Uploaded', 'Verified', 'Rejected'].includes(status)) {
+        return res.status(400).json({ msg: "Invalid status" });
+    }
+    try {
+        await pool.execute(
+            'UPDATE lead_documents SET status = ?, verified_by = ?, verified_at = CASE WHEN ? = "Verified" THEN NOW() ELSE verified_at END WHERE id = ?',
+            [status, identifier, status, docId]
+        );
+        res.json({ msg: `Document status updated to ${status}` });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/leads/:id/documents/:docId', authenticateToken, async (req, res) => {
+    const { docId } = req.params;
+    try {
+        const [rows] = await pool.execute('SELECT file_path FROM lead_documents WHERE id = ?', [docId]);
+        if (rows.length > 0 && rows[0].file_path) {
+            const fullPath = path.join(__dirname, rows[0].file_path);
+            if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+        }
+        await pool.execute('DELETE FROM lead_documents WHERE id = ?', [docId]);
+        res.json({ msg: "Document deleted" });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
 // EDIT LEAD (UPDATE)
 app.put('/api/leads/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
@@ -4019,6 +4271,20 @@ const startServer = async () => {
         const PORT = 5005;
         app.listen(PORT, '0.0.0.0', () => {
             console.log(`🚀 Bluestone CRM Backend active on port ${PORT}`);
+
+            // 🕒 INACTIVITY SWEEPER: Every 60 seconds, mark users as inactive if no click/ping
+            setInterval(async () => {
+                try {
+                    await pool.execute(`
+                        UPDATE users 
+                        SET iactive = 0 
+                        WHERE iactive = 1 
+                        AND last_active_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 1 MINUTE)
+                    `);
+                } catch (err) {
+                    console.error("[Sweeper Error]:", err.message);
+                }
+            }, 60000);
         });
     } catch (err) {
         console.error("Critical Startup Error:", err.message);
