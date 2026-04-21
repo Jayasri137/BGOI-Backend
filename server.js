@@ -59,6 +59,7 @@ const SMTP_CONFIG = {
 // --- 1. DATABASE CONNECTION ---
 const pool = mysql.createPool({
     host: 'auth-db1278.hstgr.io',
+   // host: '194.59.164.60', // Resolved from auth-db1278.hstgr.io to bypass DNS issues
     user: 'u287260207_bgoi_user',
     password: '4g@LMW2026',
     database: 'u287260207_bgoi_bg',
@@ -3512,14 +3513,15 @@ app.get('/api/master/full-structure', async (req, res) => {
 // Note: Changed 'verifyToken' to 'authenticateToken' to match your error logs
 app.delete('/api/leads/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
+    const { remarks } = req.body; // Can accept remarks from body
     try {
         const deletedBy = req.user?.id && req.user?.name
             ? `(${req.user.id}) ${req.user.name}`
             : (req.user?.name || 'System');
         // Soft delete: keep row in DB and just mark it inactive
         const [result] = await pool.query(
-            'UPDATE leads SET is_active = 0, deleted_at = NOW(), deleted_by = ? WHERE id = ?',
-            [deletedBy, id]
+            'UPDATE leads SET is_active = 0, deleted_at = NOW(), deleted_by = ?, deleted_remarks = ? WHERE id = ?',
+            [deletedBy, remarks || null, id]
         );
         if (result.affectedRows === 0) {
             return res.status(404).json({ message: "Lead not found" });
@@ -3552,6 +3554,51 @@ app.patch('/api/leads/:id/restore', authenticateToken, async (req, res) => {
     }
 });
 
+// BULK RESTORE LEADS (Super Admin Only)
+app.patch('/api/admin/leads/bulk-restore', authenticateToken, async (req, res) => {
+    const { ids } = req.body;
+    if (!isSuperAdminUser(req.user)) {
+        return res.status(403).json({ msg: "Unauthorized for bulk restoration." });
+    }
+    if (!Array.isArray(ids) || ids.length === 0) {
+        return res.status(400).json({ msg: "No lead IDs provided." });
+    }
+    try {
+        const [result] = await pool.query(
+            'UPDATE leads SET is_active = 1, deleted_at = NULL, deleted_by = NULL WHERE id IN (?) AND is_active = 0',
+            [ids]
+        );
+        res.status(200).json({ message: `${result.affectedRows} records restored successfully.` });
+    } catch (err) {
+        console.error("BULK RESTORE ERROR:", err);
+        res.status(500).json({ error: "Internal Server Error" });
+    }
+});
+
+// PERMANENTLY DELETE LEADS (Super Admin Only)
+app.delete('/api/admin/leads/permanent-delete', authenticateToken, async (req, res) => {
+    const { ids } = req.body;
+    if (!isSuperAdminUser(req.user)) {
+        return res.status(403).json({ msg: "Unauthorized for permanent deletion." });
+    }
+    if (!Array.isArray(ids) || ids.length === 0) {
+        return res.status(400).json({ msg: "No lead IDs provided." });
+    }
+    try {
+        // Clean up associated data across all related tables
+        await pool.query('DELETE FROM lead_documents WHERE lead_id IN (?)', [ids]);
+        await pool.query('DELETE FROM lead_remarks_messages WHERE lead_id IN (?)', [ids]);
+        await pool.query('DELETE FROM lead_remarks_messages_history WHERE lead_id IN (?)', [ids]);
+        await pool.query('DELETE FROM lead_edit_history WHERE lead_id IN (?)', [ids]);
+        
+        const [result] = await pool.query('DELETE FROM leads WHERE id IN (?) AND is_active = 0', [ids]);
+        res.status(200).json({ message: `${result.affectedRows} records permanently deleted.` });
+    } catch (err) {
+        console.error("PERMANENT DELETE ERROR:", err);
+        res.status(500).json({ error: "Internal Server Error" });
+    }
+});
+
 // FETCH DELETED LEADS (Super Admin Only)
 app.get('/api/admin/deleted-leads', authenticateToken, async (req, res) => {
     if (!isSuperAdminUser(req.user)) {
@@ -3571,35 +3618,125 @@ app.get('/api/admin/deleted-leads', authenticateToken, async (req, res) => {
 // DOCUMENT MANAGEMENT SYSTEM
 // ==========================================
 
-// 1. MASTER DOCUMENT REQUIREMENTS
-app.get('/api/master/documents/:level/:parentId', authenticateToken, async (req, res) => {
-    const { level, parentId } = req.params;
+// 1. MASTER DOCUMENTATION (New System)
+app.get('/api/master/documents', authenticateToken, async (req, res) => {
     try {
-        const [rows] = await pool.execute(
-            'SELECT * FROM master_document_requirements WHERE level = ? AND parent_id = ? ORDER BY document_name ASC',
-            [level, parentId]
-        );
-        res.json(rows);
+        const [docs] = await pool.execute('SELECT * FROM master_documentation ORDER BY document_name ASC');
+        const [mappings] = await pool.execute('SELECT * FROM master_documentation_mappings');
+        
+        const result = docs.map(d => ({
+            ...d,
+            access_configs: mappings.filter(m => m.doc_id === d.id)
+        }));
+        
+        res.json(result);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/master/documents', authenticateToken, async (req, res) => {
     if (!isAdminUser(req.user)) return res.status(403).json({ msg: "Admin only" });
-    const { level, parentId, documentName, isMandatory } = req.body;
+    const { documentName, isMandatory, access_configs } = req.body;
+    
+    let connection;
     try {
-        await pool.execute(
-            'INSERT INTO master_document_requirements (level, parent_id, document_name, is_mandatory) VALUES (?, ?, ?, ?)',
-            [level, parentId, documentName, isMandatory ? 1 : 0]
+        connection = await pool.getConnection();
+        await connection.beginTransaction();
+
+        const [result] = await connection.query(
+            'INSERT INTO master_documentation (document_name, is_mandatory) VALUES (?, ?)',
+            [documentName, isMandatory ? 1 : 0]
         );
-        res.json({ msg: "Document requirement added" });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        const docId = result.insertId;
+
+        if (access_configs && access_configs.length > 0) {
+            for (const cfg of access_configs) {
+                await connection.query(
+                    'INSERT INTO master_documentation_mappings (doc_id, domain_id, category_id, value_id) VALUES (?, ?, ?, ?)',
+                    [docId, cfg.domain_id || null, cfg.category_id || null, cfg.value_id || null]
+                );
+            }
+        }
+
+        await connection.commit();
+        res.json({ msg: "Document added successfully", id: docId });
+    } catch (err) {
+        if (connection) await connection.rollback();
+        res.status(500).json({ error: err.message });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+app.put('/api/master/documents/:id', authenticateToken, async (req, res) => {
+    if (!isAdminUser(req.user)) return res.status(403).json({ msg: "Admin only" });
+    const { id } = req.params;
+    const { documentName, isMandatory, access_configs } = req.body;
+    
+    let connection;
+    try {
+        connection = await pool.getConnection();
+        await connection.beginTransaction();
+
+        await connection.query(
+            'UPDATE master_documentation SET document_name = ?, is_mandatory = ? WHERE id = ?',
+            [documentName, isMandatory ? 1 : 0, id]
+        );
+
+        // Delete old mappings and insert new ones
+        await connection.query('DELETE FROM master_documentation_mappings WHERE doc_id = ?', [id]);
+
+        if (access_configs && access_configs.length > 0) {
+            for (const cfg of access_configs) {
+                await connection.query(
+                    'INSERT INTO master_documentation_mappings (doc_id, domain_id, category_id, value_id) VALUES (?, ?, ?, ?)',
+                    [id, cfg.domain_id || null, cfg.category_id || null, cfg.value_id || null]
+                );
+            }
+        }
+
+        await connection.commit();
+        res.json({ msg: "Document updated successfully" });
+    } catch (err) {
+        if (connection) await connection.rollback();
+        res.status(500).json({ error: err.message });
+    } finally {
+        if (connection) connection.release();
+    }
 });
 
 app.delete('/api/master/documents/:id', authenticateToken, async (req, res) => {
     if (!isAdminUser(req.user)) return res.status(403).json({ msg: "Admin only" });
     try {
-        await pool.execute('DELETE FROM master_document_requirements WHERE id = ?', [req.params.id]);
-        res.json({ msg: "Document requirement deleted" });
+        await pool.execute('DELETE FROM master_documentation WHERE id = ?', [req.params.id]);
+        res.json({ msg: "Document deleted successfully" });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Legacy backward compatibility for old UI if needed (Optional, but let's remove if we are fully refactoring)
+app.get('/api/master/documents/:level/:parentId', authenticateToken, async (req, res) => {
+    const { level, parentId } = req.params;
+    try {
+        // Return documents from the new system that match this specific level
+        let sql = `
+            SELECT d.* 
+            FROM master_documentation d
+            JOIN master_documentation_mappings m ON d.id = m.doc_id
+            WHERE `;
+        
+        let params = [];
+        if (level === 'domain') {
+            sql += 'm.domain_id = ? AND m.category_id IS NULL AND m.value_id IS NULL';
+            params.push(parentId);
+        } else if (level === 'category') {
+            sql += 'm.category_id = ? AND m.value_id IS NULL';
+            params.push(parentId);
+        } else if (level === 'value') {
+            sql += 'm.value_id = ?';
+            params.push(parentId);
+        }
+
+        const [rows] = await pool.execute(sql, params);
+        res.json(rows);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -3657,20 +3794,17 @@ app.get('/api/leads/:id/document-requirements', authenticateToken, async (req, r
 
         console.log(`[DocMatch] Lead ${id}: Domain(${lead.domain} -> ${normalizedDomain} -> ID:${domainId}), Cat(${lead.category} -> ID:${categoryId}), Val(${lead.interested_in} -> ID:${valueId})`);
 
-        // 3. Fetch all requirements for these IDs
-        const parentIds = [
-            { level: 'domain', id: domainId },
-            { level: 'category', id: categoryId },
-            { level: 'value', id: valueId }
-        ].filter(p => p.id);
-
+        // 3. Fetch all requirements using the new many-to-many structure
         let requirements = [];
-        if (parentIds.length > 0) {
-            const placeholders = parentIds.map(() => '(level = ? AND parent_id = ?)').join(' OR ');
-            const params = parentIds.flatMap(p => [p.level, p.id]);
+        if (domainId) {
             const [reqRows] = await pool.execute(
-                `SELECT * FROM master_document_requirements WHERE ${placeholders}`,
-                params
+                `SELECT DISTINCT d.* 
+                 FROM master_documentation d
+                 JOIN master_documentation_mappings m ON d.id = m.doc_id
+                 WHERE m.domain_id = ?
+                   AND (m.category_id IS NULL OR m.category_id = ?)
+                   AND (m.value_id IS NULL OR m.value_id = ?)`,
+                [domainId, categoryId || null, valueId || null]
             );
             requirements = reqRows;
         }
