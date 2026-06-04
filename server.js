@@ -1,5 +1,6 @@
 console.log("--- STARTING BLUESTONE BACKEND ---");
 const express = require('express');
+const axios = require('axios');
 const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -24,9 +25,53 @@ const storageDocuments = multer.diskStorage({
         cb(null, unique);
     }
 });
-const uploadDocuments = multer({ 
+const uploadDocuments = multer({
     storage: storageDocuments,
-    limits: { fileSize: 1024 * 1024 }, // 1 MB
+    limits: { fileSize: 7 * 1024 * 1024 }, // 7 MB
+    fileFilter: (req, file, cb) => {
+        const allowedMimeTypes = [
+            'application/pdf',
+            'image/jpeg',
+            'image/png',
+            'image/webp',
+            'image/gif',
+            'application/msword',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'application/vnd.ms-powerpoint',
+            'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+            'application/vnd.ms-excel',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'text/plain',
+            'text/csv'
+        ];
+        const ext = path.extname(file.originalname).toLowerCase();
+        const allowedExtensions = ['.pdf', '.jpeg', '.jpg', '.png', '.webp', '.gif', '.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx', '.csv', '.txt'];
+
+        if (allowedMimeTypes.includes(file.mimetype) || allowedExtensions.includes(ext)) {
+            cb(null, true);
+        } else {
+            cb(new Error('Invalid file type. Only PDF, Images, Word, PowerPoint, Excel, and Text files are allowed.'));
+        }
+    }
+});
+
+// Multer Config for Staff Documents
+const staffDocDir = path.join(__dirname, "uploads/staff_docs");
+if (!fs.existsSync(staffDocDir)) {
+    fs.mkdirSync(staffDocDir, { recursive: true });
+}
+const storageStaffDocs = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, "uploads/staff_docs");
+    },
+    filename: (req, file, cb) => {
+        const unique = Date.now() + "-" + file.originalname;
+        cb(null, unique);
+    }
+});
+const uploadStaffDocs = multer({
+    storage: storageStaffDocs,
+    limits: { fileSize: 1 * 1024 * 1024 }, // 1 MB limit
     fileFilter: (req, file, cb) => {
         const allowedTypes = [
             'application/pdf',
@@ -44,7 +89,24 @@ const uploadDocuments = multer({
 // Increase limits to handle Base64 images
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
-app.use(cors());
+app.use(cors({
+    origin: (origin, callback) => {
+        const allowedOrigins = [
+            'http://localhost:5173',
+            'http://127.0.0.1:5173',
+            'https://bluestonegroupofinstitutions.com',
+            'https://www.bluestonegroupofinstitutions.com',
+            'http://bluestonegroupofinstitutions.com'
+        ];
+        
+        if (!origin || allowedOrigins.some(o => origin.startsWith(o))) {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
+    credentials: true
+}));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 const JWT_SECRET = 'bg_secret_2026';
 // SMTP config (direct code config, no .env)
@@ -54,12 +116,12 @@ const SMTP_CONFIG = {
     secure: false, // true for 465
     user: 'bluestonesoftwaredeveloper@gmail.com',
     pass: 'hwmo dxbr oiub mpfr',
-    from: 'Bluestone CRM <bluestonetechparkcbe@gmail.com>'
+    from: 'Bluestone CRM <bluestoneocs@gmail.com>'
 };
 // --- 1. DATABASE CONNECTION ---
 const pool = mysql.createPool({
     host: 'auth-db1278.hstgr.io',
-   // host: '194.59.164.60', // Resolved from auth-db1278.hstgr.io to bypass DNS issues
+    // host: '194.59.164.60', // Resolved from auth-db1278.hstgr.io to bypass DNS issues
     user: 'u287260207_bgoi_user',
     password: '4g@LMW2026',
     database: 'u287260207_bgoi_bg',
@@ -352,8 +414,8 @@ function formatWho(user = {}) {
 function deriveTierFromRole(role = '') {
     const r = String(role || '').trim();
     if (['Main Admin', 'MD', 'GM', 'Super Admin'].includes(r)) return 'SUPER_ADMIN';
-    if (['TL', 'Coordinator', 'Head', 'Admin'].includes(r)) return 'ADMIN';
-    if (r === 'Staff') return 'STAFF';
+    if (['TL', 'Coordinator', 'Head', 'Admin', 'Agent Admin', 'Franchise'].includes(r)) return 'ADMIN';
+    if (['Staff', 'Agent Staff'].includes(r)) return 'STAFF';
     return 'STAFF';
 }
 function getUserTier(user = {}) {
@@ -371,12 +433,27 @@ function isStaffUser(user = {}) {
 }
 function canUserAccessLead(lead, user) {
     if (!lead || !user) return false;
+
+    // Core Super Admin: Unlimited Access
     if (isSuperAdminUser(user)) return true;
+
+    // Agent / Franchise Isolation
+    if (user.user_type === 'AGENT' || user.user_type === 'FRANCHISE') {
+        if (!user.company_name) return false; // Safety check
+        if (lead.company_name !== user.company_name) return false;
+
+        // If they match company, then check role/tier within company
+        if (getUserTier(user) === 'ADMIN') return true; // Agent Admin can see all company leads
+        return Number(lead.assigned_to) === Number(user.id); // Agent Staff only own
+    }
+
+    // Core Admin/Staff Logic
     if (getUserTier(user) === 'ADMIN') {
         const aliases = getDomainAliases(user.domain);
         return aliases.includes(lead.domain);
     }
     if (isStaffUser(user)) return Number(lead.assigned_to) === Number(user.id);
+
     return false;
 }
 
@@ -436,8 +513,43 @@ const authenticateToken = (req, res, next) => {
         if (err) {
             return res.status(403).json({ msg: "Invalid or Expired Token" });
         }
-        req.user = decodedUser;
-        next();
+
+        // 🔒 Real-time global edit & delete restriction blocker
+        const writeMethods = ['POST', 'PUT', 'PATCH', 'DELETE'];
+        const whitelistPaths = [
+            '/api/auth/ping',
+            '/api/user/heartbeat',
+            '/api/user/offline',
+            '/api/auth/verify-password',
+            '/api/leads/bulk',
+            '/api/leads'
+        ];
+
+        // If performing any editing or deletion action
+        if (writeMethods.includes(req.method) && !whitelistPaths.includes(req.path)) {
+            pool.execute(
+                'SELECT can_edit FROM users WHERE id = ? AND deleted_at IS NULL',
+                [decodedUser.id]
+            ).then(([rows]) => {
+                const userInDb = rows[0];
+                if (userInDb && userInDb.can_edit === 0) {
+                    return res.status(403).json({ msg: "Security Restriction: You do not have permission to edit or delete data in this CRM." });
+                }
+                req.user = decodedUser;
+                next();
+            }).catch(dbErr => {
+                console.error("Edit permission check error:", dbErr);
+                // Fallback to JWT payload if DB lookup fails
+                if (decodedUser.can_edit === 0) {
+                    return res.status(403).json({ msg: "Security Restriction: You do not have permission to edit or delete data in this CRM." });
+                }
+                req.user = decodedUser;
+                next();
+            });
+        } else {
+            req.user = decodedUser;
+            next();
+        }
     });
 };
 // --- 3. INITIALIZE TABLES ---
@@ -461,6 +573,18 @@ const initDB = async () => {
                 created_at DATETIME
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         `);
+
+        // ❌ MIGRATE DYNAMIC CATEGORIES FOR COUNTRY ISOLATION
+        try {
+            await connection.query("ALTER TABLE learning_categories ADD COLUMN country_code VARCHAR(50) NULL");
+        } catch (e) {
+            // Already added
+        }
+        try {
+            await connection.query("ALTER TABLE learning_categories DROP INDEX code");
+        } catch (e) {
+            // Already dropped
+        }
 
         // 🚀 PERFORMANCE OPTIMIZATION: Ensure activity_date is indexed to prevent ECONNRESET
         try {
@@ -635,7 +759,12 @@ app.post('/api/auth/login', async (req, res) => {
                 name: user.name,
                 role: user.role,
                 domain: user.domain,
-                tier: user.tier || tier
+                tier: user.tier || tier,
+                user_type: user.user_type || 'CORE',
+                company_name: user.company_name,
+                can_export_copy: user.can_export_copy || 0,
+                can_edit: user.can_edit !== undefined ? user.can_edit : 1,
+                show_country_menu: user.show_country_menu || 0
             },
             JWT_SECRET,
             { expiresIn: '12h' }
@@ -649,7 +778,12 @@ app.post('/api/auth/login', async (req, res) => {
                 role: user.role,
                 domain: user.domain,
                 designation: user.designation || null,
-                tier: user.tier || tier
+                tier: user.tier || tier,
+                user_type: user.user_type || 'CORE',
+                company_name: user.company_name,
+                can_export_copy: user.can_export_copy || 0,
+                can_edit: user.can_edit !== undefined ? user.can_edit : 1,
+                show_country_menu: user.show_country_menu || 0
             }
         });
 
@@ -665,7 +799,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
     try {
         const [rows] = await pool.execute(
-            'SELECT id, name, email, role, domain, designation, tier FROM users WHERE id = ?',
+            'SELECT id, name, email, role, domain, designation, tier, user_type, company_name, can_export_copy, can_edit, show_country_menu FROM users WHERE id = ?',
             [req.user.id]
         );
         if (rows.length === 0) return res.status(404).json({ msg: "User not found" });
@@ -718,11 +852,19 @@ app.get('/api/dashboard/stats/:timeframe/:type', authenticateToken, async (req, 
 
         let staffFilter = '';
         let staffParams = [];
+
+        // 0. Company Isolation
+        const loggedUserType = req.user.user_type || 'CORE';
+        if (loggedUserType === 'AGENT' || loggedUserType === 'FRANCHISE') {
+            staffFilter += ' AND company_name = ?';
+            staffParams.push(req.user.company_name);
+        }
+
         if (filterUserId && filterUserId !== 'All') {
-            staffFilter = " AND assigned_to = ?";
+            staffFilter += " AND assigned_to = ?";
             staffParams.push(filterUserId);
         } else if (isStaffUser(req.user)) {
-            staffFilter = " AND assigned_to = ?";
+            staffFilter += " AND assigned_to = ?";
             staffParams.push(loggedUserId);
         }
 
@@ -809,7 +951,7 @@ app.get('/api/dashboard/stats/:timeframe/:type', authenticateToken, async (req, 
 
 // --- NEW: BULK DASHBOARD STATS (Consolidates 10 requests into 1) ---
 app.get('/api/dashboard/stats-bulk', authenticateToken, async (req, res) => {
-    let { domain, userId, timeframe, date, startDate, endDate } = req.query;
+    let { domain, userId, timeframe, date, startDate, endDate, source_type, company_name: qCompanyName } = req.query;
     const { domain: userDomain } = req.user;
     const isSuperAdmin = isSuperAdminUser(req.user);
     if (!isSuperAdmin) {
@@ -824,89 +966,270 @@ app.get('/api/dashboard/stats-bulk', authenticateToken, async (req, res) => {
         }
     }
 
-    const buildMetricSql = (metricType, periodMode) => {
-        let sql = "SELECT COUNT(*) as count FROM leads WHERE is_active = 1";
+    // --- SINGLE-QUERY AGGREGATION (replaces 10 parallel queries) ---
+    // Builds WHERE clause for base filters (domain, company, staff)
+    const buildBaseWhere = () => {
+        let where = 'is_active = 1';
         let params = [];
 
         // Department/Domain Filter
         if (domain && domain !== 'All') {
-            sql = appendDomainCondition(sql, params, domain);
+            const aliases = getDomainAliases(domain);
+            if (aliases.length > 0) {
+                const likeClauses = aliases.map(() => 'domain LIKE ?').join(' OR ');
+                aliases.forEach(a => params.push(`%${a}%`));
+                where += ` AND (${likeClauses})`;
+            }
+        }
+
+        // Company Filter (Isolation)
+        const loggedUserType = req.user.user_type || 'CORE';
+        if (loggedUserType === 'AGENT' || loggedUserType === 'FRANCHISE') {
+            where += ' AND company_name = ?';
+            params.push(req.user.company_name);
         }
 
         // Staff/User Filter
         if (isStaffUser(req.user)) {
-            sql += ' AND assigned_to = ?';
+            where += ' AND assigned_to = ?';
             params.push(req.user.id);
         } else if (userId && userId !== 'All') {
-            sql += ' AND assigned_to = ?';
+            where += ' AND assigned_to = ?';
             params.push(Number(userId));
         }
 
-        // Metric Type
-        if (metricType === 'followup') sql += " AND status = 'Follow Up'";
-        else if (metricType === 'enrolled') sql += " AND (payment_status IN ('Advance payment', 'Partial Payment', 'Full payment', 'No Fee'))";
-        else if (metricType === 'pending') sql += " AND status = 'Waiting for Confirmation'";
-        else if (metricType === 'invalid') sql += " AND status = 'Invalid'";
-
-        // Timeframe
-        if (periodMode) {
-            if (timeframe === 'today' || (timeframe === 'history' && date)) {
-                sql += " AND DATE(created_at) = ?";
-                params.push(date || new Date().toISOString().split('T')[0]);
-            } else if (timeframe === 'week') {
-                sql += " AND created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)";
-            } else if (timeframe === 'month') {
-                sql += " AND created_at >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)";
-            } else if (timeframe === 'year') {
-                sql += " AND created_at >= DATE_SUB(CURDATE(), INTERVAL 365 DAY)";
-            } else if (timeframe === 'custom' && startDate && endDate) {
-                sql += " AND DATE(created_at) BETWEEN ? AND ?";
-                params.push(startDate, endDate);
+        if (source_type && source_type !== 'All') {
+            if (source_type === 'Agent') {
+                where += " AND (source_type = 'Agent' OR (company_name IS NOT NULL AND company_name NOT IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions')))";
+            } else if (source_type === 'Own') {
+                where += " AND (source_type = 'Own' OR source_type IS NULL OR source_type = '') AND (company_name IS NULL OR company_name IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions'))";
+            } else {
+                where += ' AND source_type = ?';
+                params.push(source_type);
             }
         }
-        return { sql, params };
+
+        if (qCompanyName && qCompanyName !== 'All') {
+            where += ' AND company_name = ?';
+            params.push(qCompanyName);
+        }
+
+        return { where, params };
+    };
+
+    // Builds the period date fragment
+    const buildPeriodFragment = () => {
+        if (timeframe === 'today' || (timeframe === 'history' && date)) {
+            return { fragment: 'AND DATE(created_at) = ?', periodParams: [date || getISTDay()] };
+        } else if (timeframe === 'week') {
+            return { fragment: 'AND created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)', periodParams: [] };
+        } else if (timeframe === 'month') {
+            return { fragment: 'AND created_at >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)', periodParams: [] };
+        } else if (timeframe === 'year') {
+            return { fragment: 'AND created_at >= DATE_SUB(CURDATE(), INTERVAL 365 DAY)', periodParams: [] };
+        } else if (timeframe === 'custom' && startDate && endDate) {
+            return { fragment: 'AND DATE(created_at) BETWEEN ? AND ?', periodParams: [startDate, endDate] };
+        }
+        return { fragment: 'AND created_at >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)', periodParams: [] };
     };
 
     try {
-        const metrics = [
-            'enquiry', 'followup', 'enrolled', 'pending', 'invalid'
+        const { where, params: baseParams } = buildBaseWhere();
+        const { fragment: periodFrag, periodParams } = buildPeriodFragment();
+
+        // ✅ SINGLE QUERY: All 10 stats in one DB round-trip using conditional aggregation
+        const sql = `
+            SELECT
+                COUNT(*) AS total_enquiry,
+                SUM(CASE WHEN status = 'Follow Up' THEN 1 ELSE 0 END) AS total_followup,
+                SUM(CASE WHEN payment_status IN ('Advance payment','Partial Payment','Full payment','No Fee') THEN 1 ELSE 0 END) AS total_enrolled,
+                SUM(CASE WHEN status = 'Dropped' THEN 1 ELSE 0 END) AS total_dropped,
+                SUM(CASE WHEN status = 'Waiting for Confirmation' THEN 1 ELSE 0 END) AS total_pending,
+                SUM(CASE WHEN status = 'Invalid' THEN 1 ELSE 0 END) AS total_invalid,
+                SUM(CASE WHEN ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_enquiry,
+                SUM(CASE WHEN status = 'Follow Up' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_followup,
+                SUM(CASE WHEN payment_status IN ('Advance payment','Partial Payment','Full payment','No Fee') AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_enrolled,
+                SUM(CASE WHEN status = 'Dropped' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_dropped,
+                SUM(CASE WHEN status = 'Waiting for Confirmation' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_pending,
+                SUM(CASE WHEN status = 'Invalid' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_invalid
+            FROM leads
+            WHERE ${where}
+        `;
+        // Period params are used multiple times (once per CASE in SELECT), so they must come FIRST
+        // The WHERE clause (baseParams) comes at the end of the query.
+        const allParams = [
+            ...periodParams, // for period_enquiry
+            ...periodParams, // for period_followup
+            ...periodParams, // for period_enrolled
+            ...periodParams, // for period_dropped
+            ...periodParams, // for period_pending
+            ...periodParams, // for period_invalid
+            ...baseParams    // for WHERE clause
         ];
 
-        // We run these in parallel on the server but they reuse the connection from the pool
-        const results = await Promise.all([
-            // Totals
-            ...metrics.map(m => {
-                const q = buildMetricSql(m, false);
-                return query(q.sql, q.params);
-            }),
-            // Periods
-            ...metrics.map(m => {
-                const q = buildMetricSql(m, true);
-                return query(q.sql, q.params);
-            })
-        ]);
+        const rows = await query(sql, allParams);
+        const r = rows[0] || {};
 
         res.json({
             totals: {
-                enquiry: results[0][0].count,
-                followup: results[1][0].count,
-                enrolled: results[2][0].count,
-                pending: results[3][0].count,
-                invalid: results[4][0].count,
+                enquiry: Number(r.total_enquiry || 0),
+                followup: Number(r.total_followup || 0),
+                enrolled: Number(r.total_enrolled || 0),
+                dropped: Number(r.total_dropped || 0),
+                pending: Number(r.total_pending || 0),
+                invalid: Number(r.total_invalid || 0),
             },
             periods: {
-                enquiry: results[5][0].count,
-                followup: results[6][0].count,
-                enrolled: results[7][0].count,
-                pending: results[8][0].count,
-                invalid: results[9][0].count,
+                enquiry: Number(r.period_enquiry || 0),
+                followup: Number(r.period_followup || 0),
+                enrolled: Number(r.period_enrolled || 0),
+                dropped: Number(r.period_dropped || 0),
+                pending: Number(r.period_pending || 0),
+                invalid: Number(r.period_invalid || 0),
             }
         });
     } catch (err) {
         console.error("Bulk Stats Error:", err);
-        res.status(500).json({ error: "Failed to fetch bulk stats" });
+        // Graceful fallback: return zeros so dashboard still loads
+        res.status(200).json({
+            totals: { enquiry: 0, followup: 0, enrolled: 0, dropped: 0, pending: 0, invalid: 0 },
+            periods: { enquiry: 0, followup: 0, enrolled: 0, dropped: 0, pending: 0, invalid: 0 },
+            error: 'Stats temporarily unavailable'
+        });
     }
 });
+
+// --- NEW: DOMAIN-WISE FINANCIAL ANALYTICS FOR SUPER ADMIN ONLY ---
+app.get('/api/dashboard/financial-stats', authenticateToken, async (req, res) => {
+    try {
+        if (!isSuperAdminUser(req.user)) {
+            return res.status(403).json({ error: "Access denied. Super Admin only." });
+        }
+
+        const { timeframe, date, startDate, endDate } = req.query;
+
+        // Build period filter
+        let periodWhere = '';
+        let periodParams = [];
+
+        if (timeframe === 'today' || (timeframe === 'history' && date)) {
+            periodWhere = 'AND DATE(created_at) = ?';
+            periodParams.push(date || getISTDay());
+        } else if (timeframe === 'week') {
+            periodWhere = 'AND created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)';
+        } else if (timeframe === 'month') {
+            periodWhere = 'AND created_at >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)';
+        } else if (timeframe === 'year') {
+            periodWhere = 'AND created_at >= DATE_SUB(CURDATE(), INTERVAL 365 DAY)';
+        } else if (timeframe === 'custom' && startDate && endDate) {
+            periodWhere = 'AND DATE(created_at) BETWEEN ? AND ?';
+            periodParams.push(startDate, endDate);
+        }
+
+        // 1. Fetch actual stats from leads table (grouped by short domain name)
+        const statsQuery = `
+            SELECT
+                domain,
+                COUNT(*) as total_leads,
+                SUM(CASE WHEN payment_status = 'Full payment' THEN 1 ELSE 0 END) as paid_count,
+                SUM(CASE WHEN payment_status IN ('Partial Payment', 'Advance payment') THEN 1 ELSE 0 END) as partial_count,
+                SUM(CASE WHEN (payment_status = 'Pending payment' OR payment_status IS NULL OR payment_status = '' OR payment_status = 'Pending') THEN 1 ELSE 0 END) as pending_count,
+                SUM(COALESCE(total_fees, 0)) as total_fees,
+                SUM(COALESCE(paid_amount, 0)) as paid_amount,
+                SUM(COALESCE(total_fees, 0) - COALESCE(paid_amount, 0)) as pending_amount
+            FROM leads
+            WHERE is_active = 1 AND (deleted_at IS NULL) AND status = 'Enrolled' AND payment_status IN ('Advance payment','Partial Payment','Full payment','No Fee')
+            ${periodWhere}
+            GROUP BY domain
+        `;
+
+        const [statRows] = await pool.execute(statsQuery, periodParams);
+
+        // 2. Fetch all domains from master_domains to ensure zero states are shown
+        const [domainRows] = await pool.execute('SELECT name FROM master_domains ORDER BY name ASC');
+
+        // 3. Merge results
+        const finalData = domainRows.map(md => {
+            // Normalize names: "Bluestone IAS Academy" -> "IAS Academy"
+            const shortName = md.name.replace(/^(Bluestone|BGOI)\s+/i, '').trim();
+            
+            // Find match in stats (checking both full and short name)
+            const stats = statRows.find(s => 
+                s.domain === shortName || 
+                s.domain === md.name || 
+                md.name.toLowerCase().includes(s.domain.toLowerCase())
+            );
+
+            return {
+                domain: shortName, // Return short name for UI consistency
+                total_leads: stats ? Number(stats.total_leads) : 0,
+                paid_count: stats ? Number(stats.paid_count) : 0,
+                partial_count: stats ? Number(stats.partial_count) : 0,
+                pending_count: stats ? Number(stats.pending_count) : 0,
+                total_fees: stats ? Number(stats.total_fees) : 0,
+                paid_amount: stats ? Number(stats.paid_amount) : 0,
+                pending_amount: stats ? Number(stats.pending_amount) : 0
+            };
+        });
+
+        res.status(200).json({ success: true, data: finalData });
+    } catch (err) {
+        console.error("Financial Stats API Error:", err);
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+
+// --- NEW: FINANCIAL LEADS DETAIL TABLE (Super Admin only) ---
+app.get('/api/dashboard/financial-leads', authenticateToken, async (req, res) => {
+    try {
+        if (!isSuperAdminUser(req.user)) {
+            return res.status(403).json({ error: "Super Admin only." });
+        }
+
+        const { domain, payment_status, page = 1, limit = 20 } = req.query;
+        const offset = (Number(page) - 1) * Number(limit);
+        const params = [];
+
+        let where = `WHERE l.is_active = 1 AND l.deleted_at IS NULL AND l.status = 'Enrolled'`;
+        if (domain && domain !== 'All') {
+            where = appendDomainCondition(where, params, domain, 'l');
+        }
+        if (payment_status && payment_status !== 'All') {
+            if (payment_status === 'Pending payment') {
+                // Pending payment includes null, empty, or explicitly "Pending payment"
+                where += ` AND (l.payment_status = 'Pending payment' OR l.payment_status IS NULL OR l.payment_status = '' OR l.payment_status = 'Pending')`;
+            } else {
+                where += ` AND l.payment_status = ?`;
+                params.push(payment_status);
+            }
+        }
+
+        const countSql = `SELECT COUNT(*) as total FROM leads l ${where}`;
+        const [countRows] = await pool.execute(countSql, params);
+        const total = countRows[0]?.total || 0;
+
+        const sql = `
+            SELECT 
+                l.id, l.lead_code, l.student_name, l.phone, l.email,
+                l.category, l.interested_in, l.payment_status,
+                l.total_fees, l.paid_amount,
+                (COALESCE(l.total_fees, 0) - COALESCE(l.paid_amount, 0)) AS pending_amount,
+                l.status, l.domain, l.assigned_to_name
+            FROM leads l
+            ${where}
+            ORDER BY l.total_fees DESC, l.created_at DESC
+            LIMIT ? OFFSET ?
+        `;
+        params.push(Number(limit), offset);
+        const [rows] = await pool.execute(sql, params);
+
+        res.json({ success: true, data: rows, total, page: Number(page), limit: Number(limit) });
+    } catch (err) {
+        console.error("Financial Leads Error:", err);
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+
 // --- NEW: TODAY & PENDING LEADS LIST ---
 app.get('/api/dashboard/leads-filter', authenticateToken, async (req, res) => {
     const { role, domain: userDomain, id: loggedUserId } = req.user;
@@ -917,7 +1240,9 @@ app.get('/api/dashboard/leads-filter', authenticateToken, async (req, res) => {
         timeframe = 'today',
         date,
         startDate,
-        endDate
+        endDate,
+        source_type,
+        company_name
     } = req.query;
 
     const isSuperAdmin = isSuperAdminUser(req.user);
@@ -926,11 +1251,11 @@ app.get('/api/dashboard/leads-filter', authenticateToken, async (req, res) => {
         // Standardized Base Query to match Stats Cards
         const combinedBase = `
             (
-                SELECT id, student_name, email, phone, domain, source, category, interested_in, remarks, lead_code, payment_status, total_fees, paid_amount, invalid_reason, is_active, deleted_at, deleted_by, status, assigned_to, assigned_to_name, assigned_by, assigned_by_name, created_at
+                SELECT id, student_name, email, phone, domain, source, category, interested_in, remarks, lead_code, payment_status, total_fees, paid_amount, invalid_reason, is_active, deleted_at, deleted_by, status, assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, created_at
                 FROM leads
                 WHERE is_active = 1
                 UNION ALL
-                SELECT e.id, candidate_name AS student_name, e.email, e.phone, service_type AS domain, 'Mobile App (Live)' AS source, 'Mobile Enquiry' AS category, enquiry_for AS interested_in, e.remarks, lead_code, 'Pending payment' AS payment_status, 0 AS total_fees, 0 AS paid_amount, NULL AS invalid_reason, 1 AS is_active, NULL AS deleted_at, NULL AS deleted_by, 'New' AS status, NULL AS assigned_to, NULL AS assigned_to_name, NULL AS assigned_by, NULL AS assigned_by_name, created_at
+                SELECT e.id, candidate_name AS student_name, e.email, e.phone, service_type AS domain, 'Mobile App (Live)' AS source, 'Mobile Enquiry' AS category, enquiry_for AS interested_in, e.remarks, lead_code, 'Pending payment' AS payment_status, 0 AS total_fees, 0 AS paid_amount, NULL AS invalid_reason, 1 AS is_active, NULL AS deleted_at, NULL AS deleted_by, 'New' AS status, NULL AS assigned_to, NULL AS assigned_to_name, NULL AS assigned_by, NULL AS assigned_by_name, 'Mobile' AS source_type, NULL AS company_name, created_at
                 FROM bgoi_enquiries e
                 WHERE NOT EXISTS (
                     SELECT 1 FROM leads l 
@@ -941,6 +1266,27 @@ app.get('/api/dashboard/leads-filter', authenticateToken, async (req, res) => {
 
         let sql = `SELECT * FROM ${combinedBase} WHERE 1=1`;
         let params = [];
+
+        // 0. Company Isolation
+        const loggedUserType = req.user.user_type || 'CORE';
+        if (loggedUserType === 'AGENT' || loggedUserType === 'FRANCHISE') {
+            sql += ' AND company_name = ?';
+            params.push(req.user.company_name);
+        } else if (company_name && company_name !== 'All') {
+            sql += ' AND company_name = ?';
+            params.push(company_name);
+        }
+
+        if (source_type && source_type !== 'All') {
+            if (source_type === 'Agent') {
+                sql += " AND (combined.source_type = 'Agent' OR (combined.company_name IS NOT NULL AND combined.company_name NOT IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions')))";
+            } else if (source_type === 'Own') {
+                sql += " AND (combined.source_type = 'Own' OR combined.source_type IS NULL OR combined.source_type = '') AND (combined.company_name IS NULL OR combined.company_name IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions'))";
+            } else {
+                sql += ' AND combined.source_type = ?';
+                params.push(source_type);
+            }
+        }
 
         // --- Apply Filters ---
 
@@ -969,12 +1315,9 @@ app.get('/api/dashboard/leads-filter', authenticateToken, async (req, res) => {
 
         // --- 3. Timeframe filter logic ---
         if (timeframe === 'today' || timeframe === 'history') {
-            if (date) {
-                sql += " AND DATE(created_at) = ?";
-                params.push(date);
-            } else if (timeframe === 'today') {
-                sql += " AND DATE(created_at) = CURDATE()";
-            }
+            const filterDate = date || getISTDay();
+            sql += " AND DATE(created_at) = ?";
+            params.push(filterDate);
         } else if (timeframe === 'week') {
             sql += " AND created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)";
         } else if (timeframe === 'month') {
@@ -1009,7 +1352,7 @@ app.get('/api/dashboard/leads-filter', authenticateToken, async (req, res) => {
 // Fetch Leads (Used by DomainPage.jsx)
 // Fetch Leads (Used by DomainPage.jsx)
 app.get('/api/leads', authenticateToken, async (req, res) => {
-    const { domain, assignedTo, view, page = 1, limit = 10 } = req.query;
+    const { domain, assignedTo, view, page = 1, limit = 10, source_type, company_name } = req.query;
     const pageNum = parseInt(page, 10) || 1;
     const limitNum = parseInt(limit, 10) || 10;
     const offset = (pageNum - 1) * limitNum;
@@ -1018,6 +1361,17 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
         let where = "WHERE is_active = 1";
         const filters = [];
         const isSuperAdmin = isSuperAdminUser(req.user);
+
+        // 0. Company Isolation
+        const loggedUserType = req.user.user_type || 'CORE';
+        if (loggedUserType === 'AGENT' || loggedUserType === 'FRANCHISE') {
+            where += ' AND company_name = ?';
+            filters.push(req.user.company_name);
+        } else if (company_name && company_name !== 'All') {
+            where += ' AND company_name = ?';
+            filters.push(company_name);
+        }
+
         const addDomainFilter = (domainValue) => {
             const aliases = getDomainAliases(domainValue);
             if (aliases.length <= 1) {
@@ -1049,10 +1403,21 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
         } else if (view === 'dropped') {
             where += " AND status = 'Dropped'";
         } else if (view === 'payment') {
-            // Enrolled metrics
             where += " AND (payment_status IN ('Advance payment', 'Partial Payment', 'Full payment', 'No Fee'))";
         } else if (view === 'follow-up') {
             where += " AND status = 'Follow Up'";
+        }
+
+        // --- Source Type Filter ---
+        if (source_type && source_type !== 'All') {
+            if (source_type === 'Agent') {
+                where += " AND (combined.source_type = 'Agent' OR (combined.company_name IS NOT NULL AND combined.company_name NOT IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions')))";
+            } else if (source_type === 'Own') {
+                where += " AND (combined.source_type = 'Own' OR combined.source_type IS NULL OR combined.source_type = '') AND (combined.company_name IS NULL OR combined.company_name IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions'))";
+            } else {
+                where += ' AND combined.source_type = ?';
+                filters.push(source_type);
+            }
         }
 
         const baseSql = `
@@ -1061,7 +1426,7 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
                     id, student_name, email, phone, domain, source, category, 
                     interested_in, remarks, lead_code, status, is_active, 
                     payment_status, total_fees, paid_amount,
-                    assigned_to, assigned_to_name, assigned_by, assigned_by_name, created_at
+                    assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake, created_at
                 FROM leads
                 WHERE is_active = 1
                 
@@ -1087,6 +1452,9 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
                     NULL AS assigned_to_name, 
                     NULL AS assigned_by, 
                     NULL AS assigned_by_name, 
+                    'Mobile' AS source_type,
+                    NULL AS company_name,
+                    NULL AS intake,
                     e.created_at
                 FROM bgoi_enquiries e
                 LEFT JOIN users u ON e.user_id = u.id
@@ -1126,11 +1494,25 @@ app.post('/api/auth/register', authenticateToken, async (req, res) => {
         return res.status(403).json({ msg: "Registration restricted to admins" });
     }
 
-    const { employee_id, name, email, phone, role, tier, designation, domain, password } = req.body;
+    const { employee_id, name, email, phone, role, tier, designation, domain, password, user_type, company_name } = req.body;
 
     // TIER SECURITY: Regular Admins can only create STAFF tier
-    if (!isSuperAdminUser(req.user) && tier !== 'STAFF') {
+    if (!isSuperAdminUser(req.user) && tier !== 'STAFF' && role !== 'Agent Staff') {
         return res.status(403).json({ msg: "Only Super Admins can create Admin/Super Admin accounts" });
+    }
+
+    // AGENT/FRANCHISE SECURITY:
+    let finalUserType = user_type || 'CORE';
+    let finalCompanyName = company_name || null;
+
+    const loggedUserType = req.user.user_type || 'CORE';
+
+    if (loggedUserType === 'AGENT') {
+        finalUserType = 'AGENT';
+        finalCompanyName = req.user.company_name;
+    } else if (loggedUserType === 'FRANCHISE') {
+        finalUserType = 'FRANCHISE';
+        finalCompanyName = req.user.company_name;
     }
 
     try {
@@ -1147,9 +1529,9 @@ app.post('/api/auth/register', authenticateToken, async (req, res) => {
         // 3. Save User
         const nowStr = getISTString();
         const [result] = await pool.execute(
-            `INSERT INTO users (employee_id, name, email, phone, role, tier, designation, domain, password, is_active, created_at) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
-            [employee_id, name, email, phone, role, tier, designation || null, domain, hashedPassword, nowStr]
+            `INSERT INTO users (employee_id, name, email, phone, role, tier, designation, domain, password, user_type, company_name, is_active, can_export_copy, created_at) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?)`,
+            [employee_id, name, email, phone, role, tier, designation || null, domain, hashedPassword, finalUserType, finalCompanyName, nowStr]
         );
 
         res.status(201).json({ msg: "Staff registered successfully", userId: result.insertId });
@@ -1160,7 +1542,20 @@ app.post('/api/auth/register', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/leads', async (req, res) => {
-    const { student_name, email, phone, domain, category, source, interested_in, remarks, assigned_to, assigned_to_name, assigned_by, assigned_by_name } = req.body;
+    const { student_name, email, phone, domain, category, source, interested_in, remarks, assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake } = req.body;
+
+    // Optional Auth for Portal users
+    let portalUser = null;
+    const authHeader = req.headers['authorization'];
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+        const token = authHeader.split(' ')[1];
+        try {
+            portalUser = jwt.verify(token, JWT_SECRET);
+        } catch (e) {
+            // Ignore invalid tokens for public submissions
+        }
+    }
+
     try {
         // ✅ NORMALIZE DOMAIN (CRITICAL FIX)
         const normalizedDomain = normalizeContactDomain(domain);
@@ -1177,10 +1572,27 @@ app.post('/api/leads', async (req, res) => {
         }
         const leadCode = await getNextLeadCode(normalizedDomain);
         const nowStr = getISTString();
+
+        // 🏢 Tag company_name and source_type
+        let finalSourceType = source_type || (portalUser ? (portalUser.user_type === 'AGENT' || String(portalUser.role || '').toLowerCase().includes('agent') ? 'Agent' : portalUser.user_type === 'FRANCHISE' ? 'Franchise' : 'Own') : 'Own');
+        let finalCompanyName = company_name || (portalUser ? portalUser.company_name : null);
+
+        // Fallback: If company_name is still null but we have a portal user, fetch from DB
+        if (!finalCompanyName && portalUser && portalUser.id) {
+            try {
+                const [userRows] = await pool.execute('SELECT company_name FROM users WHERE id = ?', [portalUser.id]);
+                if (userRows.length > 0 && userRows[0].company_name) {
+                    finalCompanyName = userRows[0].company_name;
+                }
+            } catch (err) {
+                console.error("Fallback company fetch failed:", err);
+            }
+        }
+
         await pool.execute(
             `INSERT INTO leads 
-            (student_name, email, phone, domain, category, source, interested_in, remarks, lead_code, status, is_active, payment_status, assigned_to, assigned_to_name, assigned_by, assigned_by_name, created_at) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1, 'Pending payment', ?, ?, ?, ?, ?)`,
+            (student_name, email, phone, domain, category, source, interested_in, remarks, lead_code, status, is_active, payment_status, assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake, created_at) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1, 'Pending payment', ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 student_name,
                 email,
@@ -1195,6 +1607,9 @@ app.post('/api/leads', async (req, res) => {
                 assigned_to_name || null,
                 assigned_by || null,
                 assigned_by_name || null,
+                finalSourceType,
+                finalCompanyName,
+                intake || null,
                 nowStr
             ]
         );
@@ -1255,7 +1670,7 @@ app.put('/api/leads/:id/status', authenticateToken, async (req, res) => {
 // Update Payment Details (Super Admin, Admin, and Staff)
 app.put('/api/leads/:id/payment', authenticateToken, async (req, res) => {
     const { id } = req.params;
-    const { payment_status, total_fees, paid_amount } = req.body;
+    const { payment_status, total_fees, paid_amount, extra_financials } = req.body;
 
     // Permissions: Allow Super Admin, Admin, Staff
     if (!isAdminUser(req.user) && !isStaffUser(req.user)) {
@@ -1264,7 +1679,7 @@ app.put('/api/leads/:id/payment', authenticateToken, async (req, res) => {
 
     try {
         const [beforeRows] = await pool.execute(
-            'SELECT domain, payment_status, total_fees, paid_amount, assigned_to, status FROM leads WHERE id = ?',
+            'SELECT domain, payment_status, total_fees, paid_amount, assigned_to, status, extra_financials FROM leads WHERE id = ?',
             [id]
         );
         if (beforeRows.length === 0) return res.status(404).json({ msg: 'Lead not found' });
@@ -1305,9 +1720,13 @@ app.put('/api/leads/:id/payment', authenticateToken, async (req, res) => {
             ? 'Enrolled'
             : before.status;
 
+        const nextExtraFinancials = extra_financials !== undefined
+            ? (typeof extra_financials === 'object' ? JSON.stringify(extra_financials) : extra_financials)
+            : before.extra_financials;
+
         await pool.execute(
-            'UPDATE leads SET payment_status = ?, total_fees = ?, paid_amount = ?, status = ? WHERE id = ?',
-            [nextPaymentStatus, nextTotalFees, nextPaidAmount, nextStatus, id]
+            'UPDATE leads SET payment_status = ?, total_fees = ?, paid_amount = ?, status = ?, extra_financials = ? WHERE id = ?',
+            [nextPaymentStatus, nextTotalFees, nextPaidAmount, nextStatus, nextExtraFinancials, id]
         );
         const changedBy = req.user?.name || 'System';
         const historyRows = [];
@@ -1338,13 +1757,15 @@ app.put('/api/leads/:id/payment', authenticateToken, async (req, res) => {
                 payment_status: nextPaymentStatus,
                 total_fees: nextTotalFees,
                 paid_amount: nextPaidAmount,
-                status: nextStatus
+                status: nextStatus,
+                extra_financials: nextExtraFinancials ? JSON.parse(nextExtraFinancials) : null
             }
         });
     } catch (err) {
         return res.status(500).json({ error: err.message });
     }
 });
+
 // Super-admin consolidated leads with advanced filters/sort/pagination
 app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
     const isSuperAdmin = isSuperAdminUser(req.user);
@@ -1366,7 +1787,9 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
         today,
         date,
         startDate,
-        endDate
+        endDate,
+        company_name,
+        source_type
     } = req.query;
     const pageNum = Math.max(parseInt(page, 10) || 1, 1);
     const limitNum = Math.max(parseInt(limit, 10) || 10, 1);
@@ -1390,7 +1813,7 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
                     id, student_name, email, phone, domain, source, category, 
                     interested_in, remarks, lead_code, status, is_active, payment_status, 
                     total_fees, paid_amount, invalid_reason,
-                    assigned_to, assigned_to_name, assigned_by, assigned_by_name, created_at
+                    assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake, created_at
                 FROM leads
                 WHERE is_active = 1
                 
@@ -1417,6 +1840,9 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
                     NULL AS assigned_to_name, 
                     NULL AS assigned_by, 
                     NULL AS assigned_by_name, 
+                    'Mobile' AS source_type,
+                    NULL AS company_name,
+                    NULL AS intake,
                     e.created_at
                 FROM bgoi_enquiries e
                 WHERE NOT EXISTS (
@@ -1425,11 +1851,19 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
                       AND l.student_name = e.candidate_name 
                       AND l.created_at = e.created_at
                 )
-            ) AS combined
-        `;
-
-        let where = ' WHERE is_active = 1';
+            ) AS combined`;
+        let where = ' WHERE 1=1';
         const params = [];
+
+        // 0. Enforce Company Isolation for Agents/Franchises
+        if (req.user.user_type === 'AGENT' || req.user.user_type === 'FRANCHISE') {
+            if (!req.user.company_name) return res.status(403).json({ error: 'User has no company assigned' });
+            where += ' AND company_name = ?';
+            params.push(req.user.company_name);
+        } else if (company_name && company_name !== 'All') {
+            where += ' AND company_name = ?';
+            params.push(company_name);
+        }
 
         // 1. Enforce Domain Security for non-SuperAdmins
         if (!isSuperAdmin) {
@@ -1483,6 +1917,17 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
             params.push(source, `%${source}%`);
         }
 
+        if (source_type && source_type !== 'All') {
+            if (source_type === 'Agent') {
+                where += " AND (combined.source_type = 'Agent' OR (combined.company_name IS NOT NULL AND combined.company_name NOT IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions')))";
+            } else if (source_type === 'Own') {
+                where += " AND (COALESCE(combined.source_type, 'Own') = 'Own') AND (combined.company_name IS NULL OR combined.company_name IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions'))";
+            } else {
+                where += ' AND combined.source_type = ?';
+                params.push(source_type);
+            }
+        }
+
         // 4. Date Range Filters
         if (today === '1') {
             where += " AND DATE(created_at) = CURDATE()";
@@ -1506,9 +1951,11 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
                 lead_code LIKE ? OR
                 status LIKE ? OR
                 remarks LIKE ? OR
-                source LIKE ?
+                source LIKE ? OR
+                company_name LIKE ? OR
+                intake LIKE ?
             )`;
-            params.push(like, like, like, like, like, like, like, like);
+            params.push(like, like, like, like, like, like, like, like, like, like);
         }
 
         // 6. View Specifics
@@ -1542,6 +1989,8 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
         });
     } catch (err) {
         console.error("BGI Leads API ERROR:", err.message);
+        console.error("SQL:", listSql);
+        console.error("PARAMS:", params);
         return res.status(500).json({ error: err.message });
     }
 });
@@ -1641,10 +2090,10 @@ app.get('/api/dashboard/summary', authenticateToken, async (req, res) => {
 app.get('/api/tl-list', authenticateToken, async (req, res) => {
     try {
         const { domain: userDomain } = req.user;
-        const { domain: queryDomain } = req.query;
+        const { domain: queryDomain, company_name, source_type } = req.query;
 
         // Determine which domain(s) to filter by
-        const filterDomain = (queryDomain && queryDomain !== 'All')
+        const filterDomain = (queryDomain && queryDomain !== 'All' && queryDomain !== 'Lead Center')
             ? queryDomain
             : (!isSuperAdminUser(req.user) ? userDomain : null);
 
@@ -1656,6 +2105,14 @@ app.get('/api/tl-list', authenticateToken, async (req, res) => {
             AND (COALESCE(h.tier, 'ADMIN') IN ('ADMIN', 'SUPER_ADMIN'))
         `;
         let params = [];
+
+        if (source_type && source_type !== 'All') {
+            if (source_type === 'Agent') {
+                query += " AND u.company_name IS NOT NULL AND u.company_name NOT IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions')";
+            } else if (source_type === 'Own') {
+                query += " AND (u.company_name IS NULL OR u.company_name IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions'))";
+            }
+        }
         // Only TL/Management can see other management personnel
         if (!isAdminUser(req.user)) {
             return res.status(403).json({ msg: "Unauthorized" });
@@ -1664,6 +2121,15 @@ app.get('/api/tl-list', authenticateToken, async (req, res) => {
         // Filter by domain
         if (filterDomain) {
             query = appendDomainCondition(query, params, filterDomain);
+        }
+
+        const userType = req.user.user_type || 'CORE';
+        if (userType === 'AGENT' || userType === 'FRANCHISE') {
+            query += " AND u.company_name = ?";
+            params.push(req.user.company_name);
+        } else if (company_name && company_name !== 'All') {
+            query += " AND u.company_name = ?";
+            params.push(company_name);
         }
 
         query += ' ORDER BY u.name ASC';
@@ -1678,10 +2144,10 @@ app.get('/api/tl-list', authenticateToken, async (req, res) => {
 app.get('/api/staff-list', authenticateToken, async (req, res) => {
     try {
         const { domain: userDomain } = req.user;
-        const { domain: queryDomain } = req.query;
+        const { domain: queryDomain, company_name, source_type } = req.query;
 
         // Determine which domain(s) to filter by
-        const filterDomain = (queryDomain && queryDomain !== 'All')
+        const filterDomain = (queryDomain && queryDomain !== 'All' && queryDomain !== 'Lead Center')
             ? queryDomain
             : (!isSuperAdminUser(req.user) ? userDomain : null);
 
@@ -1693,6 +2159,14 @@ app.get('/api/staff-list', authenticateToken, async (req, res) => {
         `;
         const params = [];
 
+        if (source_type && source_type !== 'All') {
+            if (source_type === 'Agent') {
+                query += " AND u.company_name IS NOT NULL AND u.company_name NOT IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions')";
+            } else if (source_type === 'Own') {
+                query += " AND (u.company_name IS NULL OR u.company_name IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions'))";
+            }
+        }
+
         if (filterDomain) {
             // Get all aliases for the requested domain (e.g. "Overseas" → ["Overseas", "Bluestone Overseas", ...])
             const aliases = getDomainAliases(filterDomain);
@@ -1701,6 +2175,15 @@ app.get('/api/staff-list', authenticateToken, async (req, res) => {
             const likeClauses = aliases.map(() => 'u.domain LIKE ?').join(' OR ');
             query += ` AND (${likeClauses})`;
             aliases.forEach(alias => params.push(`%${alias}%`));
+        }
+
+        const userType = req.user.user_type || 'CORE';
+        if (userType === 'AGENT' || userType === 'FRANCHISE') {
+            query += " AND u.company_name = ?";
+            params.push(req.user.company_name);
+        } else if (company_name && company_name !== 'All') {
+            query += " AND u.company_name = ?";
+            params.push(company_name);
         }
 
         query += ' ORDER BY u.name ASC';
@@ -1791,7 +2274,7 @@ app.get('/api/search/live', authenticateToken, async (req, res) => {
         let sql = `
             SELECT 
                 id, student_name, domain, phone, email, source, category, interested_in, 
-                status, assigned_to_name, assigned_by_name, remarks, lead_code, created_at,
+                status, assigned_to_name, assigned_by_name, remarks, lead_code, intake, created_at,
                 (SELECT subject FROM lead_remarks_messages WHERE lead_id = leads.id ORDER BY created_at DESC, id DESC LIMIT 1) as latest_remark_subject
             FROM leads 
             WHERE is_active = 1 AND (
@@ -1807,13 +2290,14 @@ app.get('/api/search/live', authenticateToken, async (req, res) => {
                 assigned_by_name LIKE ? OR
                 remarks LIKE ? OR
                 lead_code LIKE ? OR
+                intake LIKE ? OR
                 CAST(id AS CHAR) LIKE ?
             )
         `;
         let params = [
             like, like, like, like, like,
             like, like, like, like, like,
-            like, like, like
+            like, like, like, like
         ];
         if (isStaffUser(req.user)) {
             sql += " AND assigned_to = ?";
@@ -1904,13 +2388,15 @@ app.post('/api/leads/bulk', authenticateToken, async (req, res) => {
                 l.assigned_to_name || null,
                 l.assigned_by || null,
                 l.assigned_by_name || null,
+                l.company_name || req.user.company_name || null,
+                l.source_type || (req.user.user_type === 'AGENT' || String(req.user.role || '').toLowerCase().includes('agent') ? 'Agent' : req.user.user_type === 'FRANCHISE' ? 'Franchise' : 'Own'),
                 nowStr
             ]);
         }
 
         const sql = `
             INSERT INTO leads 
-            (student_name, email, phone, domain, source, category, interested_in, remarks, lead_code, status, is_active, assigned_to, assigned_to_name, assigned_by, assigned_by_name, created_at) 
+            (student_name, email, phone, domain, source, category, interested_in, remarks, lead_code, status, is_active, assigned_to, assigned_to_name, assigned_by, assigned_by_name, company_name, source_type, created_at) 
             VALUES ?
         `;
         await connection.query(sql, [values]);
@@ -1947,7 +2433,9 @@ app.get('/api/leads/domain/:domainName', authenticateToken, async (req, res) => 
         today,
         date,
         startDate,
-        endDate
+        endDate,
+        company_name,
+        source_type
     } = req.query;
     const pageNum = parseInt(page) || 1;
     const limitNum = parseInt(limit) || 10;
@@ -1956,10 +2444,23 @@ app.get('/api/leads/domain/:domainName', authenticateToken, async (req, res) => 
     try {
         let where = 'WHERE is_active = 1';
         let params = [];
+
+        // Company Isolation
+        const loggedUserType = req.user.user_type || 'CORE';
+        if (loggedUserType === 'AGENT' || loggedUserType === 'FRANCHISE') {
+            where += ' AND company_name = ?';
+            params.push(req.user.company_name);
+        } else if (company_name && company_name !== 'All') {
+            where += ' AND company_name = ?';
+            params.push(company_name);
+        }
+
         // ✅ FIXED DOMAIN MATCH (NO NORMALIZE HERE)
-        const aliases = getDomainAliases(domainName);
-        where += ` AND domain IN (${aliases.map(() => '?').join(', ')})`;
-        params.push(...aliases);
+        if (domainName !== 'Lead Center' && domainName !== 'All') {
+            const aliases = getDomainAliases(domainName);
+            where += ` AND domain IN (${aliases.map(() => '?').join(', ')})`;
+            params.push(...aliases);
+        }
         // ROLE
         if (isStaffUser(req.user)) {
             where += ' AND assigned_to = ?';
@@ -1977,9 +2478,11 @@ app.get('/api/leads/domain/:domainName', authenticateToken, async (req, res) => 
                 email LIKE ? OR
                 lead_code LIKE ? OR
                 remarks LIKE ? OR
-                source LIKE ?
+                source LIKE ? OR
+                company_name LIKE ? OR
+                intake LIKE ?
             )`;
-            params.push(like, like, like, like, like, like);
+            params.push(like, like, like, like, like, like, like, like);
         }
         // FILTERS
         if (status !== 'All') {
@@ -2007,6 +2510,16 @@ app.get('/api/leads/domain/:domainName', authenticateToken, async (req, res) => 
             } else {
                 where += ' AND payment_status = ?';
                 params.push(ps);
+            }
+        }
+        if (source_type && source_type !== 'All') {
+            if (source_type === 'Agent') {
+                where += " AND (source_type = 'Agent' OR (company_name IS NOT NULL AND company_name NOT IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions')))";
+            } else if (source_type === 'Own') {
+                where += " AND (COALESCE(source_type, 'Own') = 'Own') AND (company_name IS NULL OR company_name IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions'))";
+            } else {
+                where += ' AND source_type = ?';
+                params.push(source_type);
             }
         }
 
@@ -2125,11 +2638,85 @@ app.post('/api/leads/bulk-assign', authenticateToken, async (req, res) => {
     }
 });
 
+app.get('/api/agent-mail', authenticateToken, async (req, res) => {
+    try {
+        const { company_name } = req.query;
+        const loggedUserType = req.user.user_type || 'CORE';
+        const isSuperAdmin = req.user.tier === 'SUPER_ADMIN' || ['Main Admin', 'MD', 'GM', 'Super Admin'].includes(req.user.role);
+
+        let targetCompany = (loggedUserType === 'AGENT' || loggedUserType === 'FRANCHISE')
+            ? req.user.company_name
+            : company_name;
+
+        let sql = 'SELECT * FROM agent_mail_management WHERE is_active = 1';
+        let params = [];
+
+        if (targetCompany) {
+            sql += ' AND company_name = ?';
+            params.push(targetCompany);
+        } else if (!isSuperAdmin) {
+            // Non-SuperAdmin must have a target company (usually themselves)
+            return res.json([]);
+        }
+
+        sql += ' ORDER BY created_at DESC';
+        const [rows] = await pool.execute(sql, params);
+        res.json(rows);
+    } catch (err) {
+        console.error("Agent Mail Fetch Error:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/agent-mail', authenticateToken, async (req, res) => {
+    try {
+        const { email, company_name } = req.body;
+        const loggedUserType = req.user.user_type || 'CORE';
+        const isSuperAdmin = req.user.tier === 'SUPER_ADMIN' || ['Main Admin', 'MD', 'GM', 'Super Admin'].includes(req.user.role);
+
+        const targetCompany = (loggedUserType === 'AGENT' || loggedUserType === 'FRANCHISE')
+            ? req.user.company_name
+            : (company_name || (isSuperAdmin ? 'Bluestone' : null));
+
+        if (!targetCompany || !email) return res.status(400).json({ msg: "Company name and email required" });
+
+        await pool.execute(
+            'INSERT INTO agent_mail_management (company_name, email) VALUES (?, ?)',
+            [targetCompany, email]
+        );
+        res.json({ msg: "Recipient added successfully" });
+    } catch (err) {
+        console.error("Agent Mail Add Error:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.delete('/api/agent-mail/:id', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const loggedUserType = req.user.user_type || 'CORE';
+
+        let sql = 'DELETE FROM agent_mail_management WHERE id = ?';
+        let params = [id];
+
+        if (loggedUserType === 'AGENT' || loggedUserType === 'FRANCHISE') {
+            sql += ' AND company_name = ?';
+            params.push(req.user.company_name);
+        }
+
+        await pool.execute(sql, params);
+        res.json({ msg: "Recipient deleted successfully" });
+    } catch (err) {
+        console.error("Agent Mail Delete Error:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.get('/api/leads/:id/domain-staff', authenticateToken, async (req, res) => {
     const { id } = req.params;
     try {
         const [leadRows] = await pool.execute(
-            'SELECT id, domain, assigned_to, is_active FROM leads WHERE id = ? AND is_active = 1',
+            'SELECT id, domain, assigned_to, company_name, is_active FROM leads WHERE id = ? AND is_active = 1',
             [id]
         );
         if (leadRows.length === 0) return res.status(404).json({ msg: 'Lead not found' });
@@ -2137,26 +2724,51 @@ app.get('/api/leads/:id/domain-staff', authenticateToken, async (req, res) => {
         if (!canUserAccessLead(lead, req.user)) return res.status(403).json({ msg: 'Access denied' });
         const aliases = getDomainAliases(lead.domain);
         if (aliases.length === 0) return res.json([]);
-        // Use LIKE matching so multi-domain staff (e.g. "Overseas, IAS Academy") 
-        // appear in the list for each of their domains
+
         const likeClauses = aliases.map(() => 'u.domain LIKE ?').join(' OR ');
         const likeParams = aliases.map(a => `%${a}%`);
+
+        let companyFilter = "";
+        const loggedUserType = req.user.user_type || 'CORE';
+
+        // Determine which company to filter by
+        // 1. If lead belongs to an agent company
+        const leadCompany = lead.company_name;
+        const isAgentLead = leadCompany && !['-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions'].includes(leadCompany);
+
+        if (loggedUserType === 'AGENT' || loggedUserType === 'FRANCHISE') {
+            companyFilter = " AND u.company_name = ?";
+        } else {
+            // In Admin Portal, show only Core staff, even for Agent leads
+            companyFilter = " AND (u.company_name IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions') OR u.company_name IS NULL)";
+        }
+
+        const finalParams = [];
+        if (companyFilter.includes('?')) {
+            if (loggedUserType === 'AGENT' || loggedUserType === 'FRANCHISE') {
+                finalParams.push(req.user.company_name);
+            }
+        }
+        finalParams.push(...likeParams);
+
         const [rows] = await pool.execute(
-            `SELECT u.id, u.employee_id, u.name, u.email, u.phone, u.role, u.domain
+            `SELECT u.id, u.employee_id, u.name, u.email, u.phone, u.role, u.domain, u.user_type, u.company_name
              FROM users u
              LEFT JOIN master_user_hierarchy h ON h.role_name = u.role
              WHERE u.is_active = 1
+               ${companyFilter}
                AND (
                  (COALESCE(h.tier, 'STAFF') IN ('STAFF', 'ADMIN') AND (${likeClauses}))
                  OR LOWER(u.role) IN ('main admin', 'md', 'gm', 'super admin')
                  OR LOWER(u.tier) = 'super_admin'
                )
              ORDER BY (LOWER(u.tier) = 'super_admin' OR LOWER(u.role) IN ('main admin', 'md', 'gm', 'super admin')) DESC, u.role DESC, u.name ASC`,
-            likeParams
+            finalParams
         );
         res.json(rows);
     } catch (err) {
-        res.status(500).json({ error: 'Could not fetch domain staff' });
+        console.error("Domain Staff Fetch Error:", err);
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -2164,12 +2776,13 @@ app.get('/api/leads/:id/remark-messages', authenticateToken, async (req, res) =>
     const { id } = req.params;
     try {
         const [leadRows] = await pool.execute(
-            'SELECT id, domain, assigned_to, is_active FROM leads WHERE id = ? AND is_active = 1',
-            [id]
+            'SELECT id, domain, assigned_to, company_name, is_active FROM leads WHERE id = ? AND is_active = 1',
+            [Number(id)]
         );
         if (leadRows.length === 0) return res.status(404).json({ msg: 'Lead not found' });
         const lead = leadRows[0];
         if (!canUserAccessLead(lead, req.user)) return res.status(403).json({ msg: 'Access denied' });
+
         const [rows] = await pool.execute(
             `SELECT
         id,
@@ -2180,16 +2793,19 @@ app.get('/api/leads/:id/remark-messages', authenticateToken, async (req, res) =>
         attachment_name,
         attachment_type,
         sent_status,
+        created_by,
         created_at,
         updated_at
       FROM lead_remarks_messages
       WHERE lead_id = ?
       ORDER BY created_at DESC`,
-            [id]
+            [Number(id)]
         );
 
+        console.log(`Fetched ${rows.length} remark messages for lead ${id}`);
         res.json(rows);
     } catch (err) {
+        console.error("Fetch remark messages error:", err);
         res.status(500).json({ error: 'Could not fetch remark messages' });
     }
 });
@@ -2223,8 +2839,9 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
         description,
         recipientUserIds = [],
         systemRecipientIds = [],
+        agentRecipientIds = [],
         primaryRecipientId = null,
-        includeCandidateBCC = true,
+        includeCandidateBCC = false,
         attachment_base64,
         attachment_name,
         attachment_type
@@ -2233,10 +2850,13 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
     try {
         if (typeof recipientUserIds === "string") recipientUserIds = JSON.parse(recipientUserIds);
         if (typeof systemRecipientIds === "string") systemRecipientIds = JSON.parse(systemRecipientIds);
+        if (typeof agentRecipientIds === "string") agentRecipientIds = JSON.parse(agentRecipientIds);
     } catch {
         recipientUserIds = [];
         systemRecipientIds = [];
+        agentRecipientIds = [];
     }
+    console.log("REMARK SEND REQ BODY:", JSON.stringify(req.body, null, 2));
     if (!subject || !description) {
         return res.status(400).json({
             msg: "subject and description are required"
@@ -2244,7 +2864,7 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
     }
     try {
         const [leadRows] = await pool.execute(
-            `SELECT id, lead_code, student_name, email, domain, assigned_to, is_active
+            `SELECT id, lead_code, student_name, email, domain, assigned_to, company_name, is_active
        FROM leads
        WHERE id = ? AND is_active = 1`,
             [id]
@@ -2280,7 +2900,8 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
           WHERE u.is_active = 1
           AND (
              (COALESCE(h.tier, 'STAFF') IN ('STAFF', 'ADMIN') AND (${domainLikeClauses}))
-             OR u.role = 'Super Admin'
+             OR LOWER(u.role) IN ('main admin', 'md', 'gm', 'super admin')
+             OR LOWER(u.tier) = 'super_admin'
           )
           AND u.id IN (${idPlaceholders})`,
                 [...domainLikeParams, ...normalizedIds]
@@ -2322,20 +2943,81 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
             });
         }
 
+        // --- NEW: FETCH AGENT MANAGED EMAILS ---
+        let agentEmails = [];
+        const normAgentIds = Array.from(
+            new Set(
+                (Array.isArray(agentRecipientIds) ? agentRecipientIds : [])
+                    .map((v) => Number(v))
+                    .filter((v) => Number.isInteger(v) && v > 0)
+            )
+        );
+
+        if (normAgentIds.length > 0) {
+            const qm = normAgentIds.map(() => "?").join(",");
+            const [agentRows] = await pool.execute(
+                `SELECT email FROM agent_mail_management WHERE id IN (${qm}) AND is_active = 1`,
+                normAgentIds
+            );
+            agentEmails = agentRows.map(r => r.email);
+        }
+
+        // Fallback: Check if primaryRecipientId belongs to Agent Mail if not found in System Mail
+        if (!primaryEmail && primaryRecipientId) {
+            const [agentPrimRows] = await pool.execute(
+                `SELECT email FROM agent_mail_management WHERE id = ? AND is_active = 1`,
+                [primaryRecipientId]
+            );
+            if (agentPrimRows.length > 0) primaryEmail = agentPrimRows[0].email;
+        }
+
+        // --- NEW: HANDLE COMPANY DEFAULTS (REPLACE BLUESTONEOCS FOR AGENTS) ---
+        const isAgentComp = lead.company_name && !['-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions'].includes(lead.company_name);
+        let companyDefaultEmails = [];
+        if (isAgentComp) {
+            const [compRows] = await pool.execute(
+                `SELECT email FROM agent_mail_management WHERE company_name = ? AND is_active = 1`,
+                [lead.company_name]
+            );
+            companyDefaultEmails = compRows.map(r => r.email);
+        }
+
         const staffEmails = staffRows.map(u => u.email).filter(Boolean);
         const candidateEmail = lead.email;
-        const [superAdmins] = await pool.execute(
-            `SELECT email, name, role FROM users 
-             WHERE (LOWER(role) IN ('main admin', 'md', 'gm', 'super admin') OR LOWER(tier) = 'super_admin') 
-               AND is_active = 1`
-        );
-        const superAdminEmails = superAdmins.map(u => u.email).filter(Boolean);
 
-        const allCCEmails = [...new Set([...staffEmails, ...superAdminEmails, ...systemEmails])];
+        // Strictly only what is selected or specifically requested (no automatic background CCs)
+        const allCCEmails = [...new Set([
+            ...staffEmails,
+            ...systemEmails,
+            ...agentEmails
+        ])];
 
-        const finalTo = primaryEmail || "bluestoneocs@gmail.com";
+        let finalTo = primaryEmail;
+
+        // Safety: Candidate email should NEVER be the primary 'To' recipient for internal remarks
+        if (finalTo && candidateEmail && finalTo.toLowerCase() === candidateEmail.toLowerCase()) {
+            finalTo = null;
+        }
+
+        if (!finalTo) {
+            if (isAgentComp && companyDefaultEmails.length > 0) {
+                // Find first office email that isn't the candidate
+                finalTo = companyDefaultEmails.find(e => e.toLowerCase() !== (candidateEmail || '').toLowerCase()) || companyDefaultEmails[0];
+                if (finalTo && candidateEmail && finalTo.toLowerCase() === candidateEmail.toLowerCase()) {
+                    finalTo = "bluestoneocs@gmail.com";
+                }
+            } else {
+                finalTo = "bluestoneocs@gmail.com";
+            }
+        }
         const finalCC = allCCEmails.length > 0 ? allCCEmails.join(",") : null;
-        const finalBCC = includeCandidateBCC && candidateEmail ? candidateEmail : null;
+
+        // BCC Logic: Always include system default in background, candidate only if enabled
+        const bccList = ["bluestoneocs@gmail.com"];
+        if (includeCandidateBCC && candidateEmail) {
+            bccList.push(candidateEmail);
+        }
+        const finalBCC = bccList.join(",");
 
         console.log("--- REMARK EMAIL DEBUG ---");
         console.log("TO (Dev):", finalTo);
@@ -2392,7 +3074,7 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
         }
         const nowStr = getISTString();
         // Save to database
-        await pool.execute(
+        const [insertResult] = await pool.execute(
             `INSERT INTO lead_remarks_messages
       (
         lead_id,
@@ -2428,6 +3110,8 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
                 nowStr
             ]
         );
+        console.log(`Saved remark message ${insertResult.insertId} for lead ${id}. Status: ${sentStatus}`);
+
         if (sentStatus !== "SENT") {
             return res.status(400).json({
                 msg: `Saved, but mail not sent: ${sentError}`
@@ -2454,7 +3138,7 @@ app.put('/api/leads/:id/remark-messages/:messageId',
             subject,
             description,
             recipientUserIds = [],
-            includeCandidateBCC = true,
+            includeCandidateBCC = false,
             attachment_base64,
             attachment_name,
             attachment_type
@@ -2542,7 +3226,13 @@ app.put('/api/leads/:id/remark-messages/:messageId',
 
             const finalTo = "bluestoneocs@gmail.com";
             const finalCC = allCCEmails.length > 0 ? allCCEmails.join(",") : null;
-            const finalBCC = includeCandidateBCC && candidateEmail ? candidateEmail : null;
+
+            // Sync BCC Logic with POST: Always include system default in background
+            const bccList = ["bluestoneocs@gmail.com"];
+            if (includeCandidateBCC && candidateEmail) {
+                bccList.push(candidateEmail);
+            }
+            const finalBCC = bccList.join(",");
 
             console.log("--- REMARK EMAIL EDIT DEBUG ---");
             console.log("TO (Dev):", finalTo);
@@ -2660,12 +3350,11 @@ app.get('/api/leads/remark-history/:messageId', authenticateToken, async (req, r
     }
 });
 // --- NOTIFICATION / LIVE FEED ROUTES ---
-// 1. Get all active notifications
 app.get('/api/notifications/all', authenticateToken, async (req, res) => {
     try {
-        // Use [rows] to destructure the result from mysql2/promise
+        // 1. Get all active notifications (Admins see everything)
         const [rows] = await pool.execute(
-            `SELECT id, date, message, is_active, flag, created_at, updated_at,
+            `SELECT id, date, message, is_active, flag, target_domains, target_user_ids, created_at, updated_at,
                     COALESCE(NULLIF(updated_by, ''), NULLIF(created_by, ''), 'System') AS updated_by
              FROM notifications
              WHERE flag = 1
@@ -2682,7 +3371,7 @@ app.get('/api/notifications/all', authenticateToken, async (req, res) => {
 });
 // 2. Create Notification (allow multiple notifications for same date)
 app.post('/api/notifications', authenticateToken, async (req, res) => {
-    const { date, message } = req.body;
+    const { date, message, target_domains, target_user_ids } = req.body;
     const { role } = req.user;
     const actorName = req.user?.name || req.user?.email || "System";
     // Optional: Restrict to Admins/TLs if you don't want Staff posting broadcasts
@@ -2696,14 +3385,14 @@ app.post('/api/notifications', authenticateToken, async (req, res) => {
         const nowStr = getISTString();
         // Always insert a new row, even if same date exists.
         const [result] = await pool.execute(
-            'INSERT INTO notifications (date, message, flag, is_active, created_by, updated_by, created_at, updated_at) VALUES (?, ?, 1, 1, ?, ?, ?, ?)',
-            [date, message, actorName, actorName, nowStr, nowStr]
+            'INSERT INTO notifications (date, message, flag, is_active, target_domains, target_user_ids, created_by, updated_by, created_at, updated_at) VALUES (?, ?, 1, 1, ?, ?, ?, ?, ?, ?)',
+            [date, message, target_domains || null, target_user_ids || null, actorName, actorName, nowStr, nowStr]
         );
         const newId = result.insertId;
 
         await pool.execute(
-            'INSERT INTO notifications_history (notification_id, action_type, new_message, new_date, new_is_active, changed_by, changed_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            [newId, 'CREATED', message, date, 1, actorName, nowStr]
+            'INSERT INTO notifications_history (notification_id, action_type, new_message, new_date, new_is_active, new_target_domains, new_target_user_ids, changed_by, changed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [newId, 'CREATED', message, date, 1, target_domains || null, target_user_ids || null, actorName, nowStr]
         );
         res.status(201).json({ msg: "Notification created successfully" });
     } catch (err) {
@@ -2713,10 +3402,10 @@ app.post('/api/notifications', authenticateToken, async (req, res) => {
 });
 app.put('/api/notifications/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
-    const { message, date, is_active } = req.body;
+    const { message, date, is_active, target_domains, target_user_ids } = req.body;
     const actorName = req.user?.name || req.user?.email || "System";
     try {
-        const [oldRows] = await pool.execute('SELECT message, date, is_active FROM notifications WHERE id = ? AND flag = 1', [id]);
+        const [oldRows] = await pool.execute('SELECT message, date, is_active, target_domains, target_user_ids FROM notifications WHERE id = ? AND flag = 1', [id]);
         if (oldRows.length === 0) {
             return res.status(404).json({ error: "Notification not found" });
         }
@@ -2724,13 +3413,13 @@ app.put('/api/notifications/:id', authenticateToken, async (req, res) => {
         const nowStr = getISTString();
         const [result] = await pool.execute(
             `UPDATE notifications 
-       SET message = ?, date = ?, is_active = ?, updated_by = ?, updated_at = ? 
+       SET message = ?, date = ?, is_active = ?, target_domains = ?, target_user_ids = ?, updated_by = ?, updated_at = ? 
        WHERE id = ?`,
-            [message, date, is_active ?? 1, actorName, nowStr, id]
+            [message, date, is_active ?? 1, target_domains || null, target_user_ids || null, actorName, nowStr, id]
         );
         await pool.execute(
-            'INSERT INTO notifications_history (notification_id, action_type, old_message, new_message, old_date, new_date, old_is_active, new_is_active, changed_by, changed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            [id, 'UPDATED', oldData.message, message, oldData.date, date, oldData.is_active, is_active ?? 1, actorName, nowStr]
+            'INSERT INTO notifications_history (notification_id, action_type, old_message, new_message, old_date, new_date, old_is_active, new_is_active, old_target_domains, new_target_domains, old_target_user_ids, new_target_user_ids, changed_by, changed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [id, 'UPDATED', oldData.message, message, oldData.date, date, oldData.is_active, is_active ?? 1, oldData.target_domains, target_domains || null, oldData.target_user_ids, target_user_ids || null, actorName, nowStr]
         );
         res.json({ success: true, message: "Updated successfully" });
     } catch (err) {
@@ -2801,19 +3490,45 @@ app.get('/api/notifications/:id/history', authenticateToken, async (req, res) =>
         res.status(500).json({ error: "Failed to fetch history" });
     }
 });
-// GET: Fetch ALL messages for a specific date
+// GET: Fetch ALL messages for a specific date, filtered for the current user
 app.get('/api/notifications', authenticateToken, async (req, res) => {
     const { date } = req.query;
+    const userId = req.user.id;
+    const userDomain = String(req.user.domain || '').toLowerCase();
+    const isSuper = isSuperAdminUser(req.user);
+
     try {
+        // Fetch all active notifications for the date
         const [rows] = await pool.execute(
-            `SELECT id, date, message, is_active, flag, created_at, updated_at,
+            `SELECT id, date, message, is_active, flag, target_domains, target_user_ids, created_at, updated_at,
               COALESCE(NULLIF(updated_by, ''), NULLIF(created_by, ''), 'System') AS updated_by
        FROM notifications 
        WHERE DATE(date) = ? AND is_active = 1 AND flag = 1
        ORDER BY created_at DESC, id DESC`,
             [date]
         );
-        res.json(rows);
+
+        if (isSuper) return res.json(rows);
+
+        // Filter based on domain and userId
+        const filtered = rows.filter(n => {
+            const tDomains = String(n.target_domains || '').toLowerCase().split(',').map(d => d.trim()).filter(Boolean);
+            const tUserIds = String(n.target_user_ids || '').split(',').map(u => u.trim()).filter(Boolean);
+
+            // If both are empty, it's global
+            if (tDomains.length === 0 && tUserIds.length === 0) return true;
+
+            // Check if user ID is targeted
+            if (tUserIds.includes(String(userId))) return true;
+
+            // Check if any of user's domains are targeted
+            const myDomains = userDomain.split(',').map(d => d.trim()).filter(Boolean);
+            if (myDomains.some(md => tDomains.includes(md))) return true;
+
+            return false;
+        });
+
+        res.json(filtered);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -2838,18 +3553,46 @@ app.get('/api/notifications/calendar', authenticateToken, async (req, res) => {
     const { month } = req.query; // YYYY-MM
     const start = `${month}-01`;
     const end = `${month}-31`;
+    const userId = req.user.id;
+    const userDomain = String(req.user.domain || '').toLowerCase();
+    const isSuper = isSuperAdminUser(req.user);
+
     try {
+        // Fetch all matching notifications for the month
         const [rows] = await pool.execute(
-            `SELECT DATE(date) as date_key, COUNT(*) as count
+            `SELECT id, DATE(date) as date_key, target_domains, target_user_ids
        FROM notifications
        WHERE date BETWEEN ? AND ?
        AND flag = 1
-       AND is_active = 1
-       GROUP BY DATE(date)
-       ORDER BY DATE(date) ASC`,
+       AND is_active = 1`,
             [start, end]
         );
-        res.json(rows);
+
+        let finalRows = rows;
+        if (!isSuper) {
+            finalRows = rows.filter(n => {
+                const tDomains = String(n.target_domains || '').toLowerCase().split(',').map(d => d.trim()).filter(Boolean);
+                const tUserIds = String(n.target_user_ids || '').split(',').map(u => u.trim()).filter(Boolean);
+                if (tDomains.length === 0 && tUserIds.length === 0) return true;
+                if (tUserIds.includes(String(userId))) return true;
+                const myDomains = userDomain.split(',').map(d => d.trim()).filter(Boolean);
+                return myDomains.some(md => tDomains.includes(md));
+            });
+        }
+
+        // Aggregate by date
+        const counts = finalRows.reduce((acc, row) => {
+            const key = row.date_key;
+            acc[key] = (acc[key] || 0) + 1;
+            return acc;
+        }, {});
+
+        const result = Object.keys(counts).map(date => ({
+            date_key: date,
+            count: counts[date]
+        }));
+
+        res.json(result);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -2865,12 +3608,12 @@ app.get('/api/search', authenticateToken, async (req, res) => {
     try {
         const like = `%${query}%`;
         const [rows] = await pool.execute(
-            `SELECT * FROM leads WHERE is_active = 1 AND (student_name LIKE ? OR phone LIKE ? OR email LIKE ? OR domain LIKE ?) ORDER BY created_at DESC LIMIT ? OFFSET ?`,
-            [like, like, like, like, limitNum, offset]
+            `SELECT * FROM leads WHERE is_active = 1 AND (student_name LIKE ? OR phone LIKE ? OR email LIKE ? OR domain LIKE ? OR intake LIKE ?) ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+            [like, like, like, like, like, limitNum, offset]
         );
         const [countResult] = await pool.execute(
-            `SELECT COUNT(*) as total FROM leads WHERE is_active = 1 AND (student_name LIKE ? OR phone LIKE ? OR email LIKE ? OR domain LIKE ?)`,
-            [like, like, like, like]
+            `SELECT COUNT(*) as total FROM leads WHERE is_active = 1 AND (student_name LIKE ? OR phone LIKE ? OR email LIKE ? OR domain LIKE ? OR intake LIKE ?)`,
+            [like, like, like, like, like]
         );
         const total = countResult[0].total;
 
@@ -2955,7 +3698,7 @@ app.put('/api/auth/profile', authenticateToken, async (req, res) => {
         );
         // 3. Return updated user
         const [updated] = await pool.execute(
-            'SELECT id, name, email, phone, role, domain, avatar FROM users WHERE id = ? AND is_active = 1',
+            'SELECT id, name, email, phone, role, domain, avatar, can_export_copy, can_edit, show_country_menu FROM users WHERE id = ? AND is_active = 1',
             [userId]
         );
 
@@ -2988,21 +3731,33 @@ app.post('/api/auth/verify-password', authenticateToken, async (req, res) => {
 app.get('/api/staff-directory', authenticateToken, async (req, res) => {
     try {
         const [rows] = await pool.execute(
-            'SELECT id, employee_id, name, role, tier, designation, domain, phone, email, avatar, is_active, last_active_at, TIMESTAMPDIFF(SECOND, last_active_at, CURRENT_TIMESTAMP) AS seconds_since_active FROM users WHERE deleted_at IS NULL ORDER BY id DESC'
+            'SELECT id, employee_id, name, role, tier, user_type, company_name, designation, domain, phone, email, avatar, is_active, can_export_copy, can_edit, show_country_menu, last_active_at, TIMESTAMPDIFF(SECOND, last_active_at, CURRENT_TIMESTAMP) AS seconds_since_active FROM users WHERE deleted_at IS NULL ORDER BY id DESC'
         );
-        if (isSuperAdminUser(req.user)) {
+
+        // Core Super Admin: Sees everything
+        const userType = req.user.user_type || 'CORE';
+        if (isSuperAdminUser(req.user) && userType === 'CORE') {
             return res.json(rows);
         }
+
+        // Agent / Franchise Admin: Only see their own company staff
+        if (userType === 'AGENT' || userType === 'FRANCHISE') {
+            const filtered = rows.filter(u => u.company_name === req.user.company_name);
+            return res.json(filtered);
+        }
+
+        // Core Admin: See staff in their domain
         if (!isAdminUser(req.user)) {
             return res.status(403).json({ msg: "Unauthorized to view staff directory." });
         }
         const allowed = getDomainAliases(req.user?.domain || '').map((d) => String(d).trim().toLowerCase());
         const filtered = rows.filter((u) => {
+            const staffUserType = u.user_type || 'CORE';
+            if (staffUserType !== 'CORE') return false; // Core Admin shouldn't see Agents/Franchises unless explicitly allowed
             const domains = String(u.domain || '')
                 .split(',')
                 .map((d) => d.trim().toLowerCase())
                 .filter(Boolean);
-            // Admins should not see "All" users
             if (domains.includes('all')) return false;
             const isStaff = deriveTierFromRole(u.role) === 'STAFF';
             if (!isStaff) return false;
@@ -3065,6 +3820,229 @@ app.patch('/api/staff/:id/status', authenticateToken, async (req, res) => {
         res.status(500).json({ error: "Failed to update staff status" });
     }
 });
+
+// 1c. Toggle Staff Export & Copy Permission
+app.patch('/api/staff/:id/export-copy', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const { can_export_copy } = req.body;
+
+    // Security: Only Super Admins can toggle this permission
+    const isSuperAdmin = req.user.tier === 'SUPER_ADMIN' || ['Main Admin', 'MD', 'GM', 'Super Admin'].includes(req.user.role);
+    if (!isSuperAdmin) {
+        return res.status(403).json({ msg: "Only Super Admins can control export/copy permissions." });
+    }
+
+    try {
+        const [beforeRows] = await pool.execute(
+            'SELECT name, can_export_copy FROM users WHERE id = ? AND deleted_at IS NULL',
+            [id]
+        );
+        if (beforeRows.length === 0) return res.status(404).json({ msg: "User not found" });
+        const before = beforeRows[0];
+
+        const newValue = Number(can_export_copy) ? 1 : 0;
+
+        await pool.execute(
+            'UPDATE users SET can_export_copy = ? WHERE id = ? AND deleted_at IS NULL',
+            [newValue, id]
+        );
+
+        const changedBy = req.user?.name || 'System';
+        await pool.execute(
+            `INSERT INTO user_edit_history (user_id, action_type, field_name, old_value, new_value, changed_by, changed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [
+                id,
+                'USER_PERMISSIONS',
+                'can_export_copy',
+                String(before.can_export_copy || 0),
+                String(newValue),
+                changedBy,
+                getISTString()
+            ]
+        );
+
+        res.json({ msg: "Export and copy permission updated successfully", can_export_copy: newValue });
+    } catch (err) {
+        console.error("Export copy toggle error:", err);
+        res.status(500).json({ error: "Failed to update export/copy permission" });
+    }
+});
+
+// 1d. Toggle Staff Edit Permission
+app.patch('/api/staff/:id/edit-permission', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const { can_edit } = req.body;
+
+    // Security: Only Super Admins can toggle this permission
+    const isSuperAdmin = req.user.tier === 'SUPER_ADMIN' || ['Main Admin', 'MD', 'GM', 'Super Admin'].includes(req.user.role);
+    if (!isSuperAdmin) {
+        return res.status(403).json({ msg: "Only Super Admins can control edit permissions." });
+    }
+
+    try {
+        const [beforeRows] = await pool.execute(
+            'SELECT name, can_edit FROM users WHERE id = ? AND deleted_at IS NULL',
+            [id]
+        );
+        if (beforeRows.length === 0) return res.status(404).json({ msg: "User not found" });
+        const before = beforeRows[0];
+
+        const newValue = Number(can_edit) ? 1 : 0;
+
+        await pool.execute(
+            'UPDATE users SET can_edit = ? WHERE id = ? AND deleted_at IS NULL',
+            [newValue, id]
+        );
+
+        const changedBy = req.user?.name || 'System';
+        await pool.execute(
+            `INSERT INTO user_edit_history (user_id, action_type, field_name, old_value, new_value, changed_by, changed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [
+                id,
+                'USER_PERMISSIONS',
+                'can_edit',
+                String(before.can_edit !== undefined ? before.can_edit : 1),
+                String(newValue),
+                changedBy,
+                getISTString()
+            ]
+        );
+
+        res.json({ msg: "Edit permission updated successfully", can_edit: newValue });
+    } catch (err) {
+        console.error("Edit toggle error:", err);
+        res.status(500).json({ error: "Failed to update edit permission" });
+    }
+});
+
+// 1f. Toggle Country Details Sidebar Menu Permission
+app.patch('/api/staff/:id/country-menu', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const { show_country_menu } = req.body;
+
+    // Security: Only Super Admins can toggle this permission
+    const isSuperAdmin = req.user.tier === 'SUPER_ADMIN' || ['Main Admin', 'MD', 'GM', 'Super Admin'].includes(req.user.role);
+    if (!isSuperAdmin) {
+        return res.status(403).json({ msg: "Only Super Admins can control sidebar menu permissions." });
+    }
+
+    try {
+        const [beforeRows] = await pool.execute(
+            'SELECT name, show_country_menu FROM users WHERE id = ? AND deleted_at IS NULL',
+            [id]
+        );
+        if (beforeRows.length === 0) return res.status(404).json({ msg: "User not found" });
+        const before = beforeRows[0];
+
+        const newValue = Number(show_country_menu) ? 1 : 0;
+
+        await pool.execute(
+            'UPDATE users SET show_country_menu = ? WHERE id = ? AND deleted_at IS NULL',
+            [newValue, id]
+        );
+
+        const changedBy = req.user?.name || 'System';
+        await pool.execute(
+            `INSERT INTO user_edit_history (user_id, action_type, field_name, old_value, new_value, changed_by, changed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [
+                id,
+                'USER_PERMISSIONS',
+                'show_country_menu',
+                String(before.show_country_menu || 0),
+                String(newValue),
+                changedBy,
+                getISTString()
+            ]
+        );
+
+        res.json({ msg: "Country details menu permission updated successfully", show_country_menu: newValue });
+    } catch (err) {
+        console.error("Country menu toggle error:", err);
+        res.status(500).json({ error: "Failed to update country details menu permission" });
+    }
+});
+
+// 1e. Log Security Violation and Send Email Notification to bluestoneocs@gmail.com
+app.post('/api/security/log-violation', authenticateToken, async (req, res) => {
+    const { actionType, details } = req.body;
+    const userObj = req.user;
+
+    console.log(`\n🔒 [Security Shield] VIOLATION RECEIVED: "${actionType}"`);
+    console.log(`👤 User: ${userObj?.name} (${userObj?.email}) - Role: ${userObj?.role || 'Staff'}`);
+    console.log(`📋 Details: ${details || 'None'}`);
+
+    if (!actionType) {
+        return res.status(400).json({ error: "Action type is required" });
+    }
+
+    try {
+        // Formulate Email content nicely using HTML
+        const subject = `⚠️ Bluestone CRM Security Alert: ${actionType} Attempted by ${userObj.name}`;
+        const htmlContent = `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);">
+                <div style="background-color: #ef4444; color: #ffffff; padding: 20px; text-align: center;">
+                    <h2 style="margin: 0; font-size: 20px; text-transform: uppercase; letter-spacing: 1px;">Bluestone Security Alert</h2>
+                </div>
+                <div style="padding: 24px; color: #334155;">
+                    <p style="font-size: 16px; line-height: 1.5; margin-top: 0;">Dear Administrator,</p>
+                    <p style="font-size: 14px; line-height: 1.6; color: #475569;">
+                        A security access violation was detected and successfully blocked inside the Bluestone Groups CRM. Details of the incident are below:
+                    </p>
+                    
+                    <div style="background-color: #f8fafc; border-left: 4px solid #ef4444; padding: 16px; margin: 20px 0; border-radius: 4px;">
+                        <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+                            <tr>
+                                <td style="padding: 6px 0; font-weight: bold; color: #1e293b; width: 140px;">User Name:</td>
+                                <td style="padding: 6px 0; color: #475569;">${userObj.name}</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 6px 0; font-weight: bold; color: #1e293b;">User Email:</td>
+                                <td style="padding: 6px 0; color: #475569;">${userObj.email}</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 6px 0; font-weight: bold; color: #1e293b;">User Role / Tier:</td>
+                                <td style="padding: 6px 0; color: #475569;">${userObj.role || 'Staff'} (${userObj.tier || 'STAFF'})</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 6px 0; font-weight: bold; color: #1e293b;">Assigned Domains:</td>
+                                <td style="padding: 6px 0; color: #475569;">${userObj.domain || 'None'}</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 6px 0; font-weight: bold; color: #1e293b;">Violation Type:</td>
+                                <td style="padding: 6px 0; color: #ef4444; font-weight: bold;">${actionType}</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 6px 0; font-weight: bold; color: #1e293b;">Description:</td>
+                                <td style="padding: 6px 0; color: #475569;">${details || 'No additional details provided.'}</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 6px 0; font-weight: bold; color: #1e293b;">Time of Event (IST):</td>
+                                <td style="padding: 6px 0; color: #475569;">${getISTString()}</td>
+                            </tr>
+                        </table>
+                    </div>
+                    
+                    <p style="font-size: 12px; color: #94a3b8; margin-top: 30px; text-align: center; border-top: 1px solid #f1f5f9; padding-top: 15px;">
+                        This is an automated alert generated by the Bluestone Groups Security Shield. Please review the user permissions under User Management if necessary.
+                    </p>
+                </div>
+            </div>
+        `;
+
+        console.log(`✉️ [Security Shield] Dispatching alert email to bluestoneocs@gmail.com...`);
+        // Send email to bluestoneocs@gmail.com
+        await sendContactEmail('bluestoneocs@gmail.com', subject, htmlContent);
+        console.log(`✅ [Security Shield] Alert email successfully sent to bluestoneocs@gmail.com!`);
+
+        res.json({ success: true, msg: "Violation logged and administrator notified." });
+    } catch (err) {
+        console.error("❌ [Security Shield] Failed to log violation / send email:", err);
+        res.status(500).json({ error: "Failed to process security violation report." });
+    }
+});
 // 2. Delete Staff Member
 app.delete('/api/staff/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
@@ -3108,7 +4086,7 @@ app.delete('/api/staff/:id', authenticateToken, async (req, res) => {
 // 3. Edit Staff Member (Update role/domain/phone)
 app.put('/api/staff/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
-    const { employee_id, name, email, phone, role, tier, designation, domain, password } = req.body;
+    const { employee_id, name, email, phone, role, tier, designation, domain, password, user_type, company_name } = req.body;
 
     // Security: Only Admins can edit
     if (!isAdminUser(req.user)) {
@@ -3117,11 +4095,19 @@ app.put('/api/staff/:id', authenticateToken, async (req, res) => {
 
     try {
         const [beforeRows] = await pool.execute(
-            'SELECT employee_id, name, email, phone, role, tier, designation, domain FROM users WHERE id = ? AND is_active = 1',
+            'SELECT employee_id, name, email, phone, role, tier, designation, domain, user_type, company_name, can_export_copy, can_edit, show_country_menu FROM users WHERE id = ? AND is_active = 1',
             [id]
         );
         if (beforeRows.length === 0) return res.status(404).json({ msg: "User not found" });
         const before = beforeRows[0];
+
+        // Security: Agent / Franchise isolation
+        const loggedUserType = req.user.user_type || 'CORE';
+        if (loggedUserType === 'AGENT' || loggedUserType === 'FRANCHISE') {
+            if (before.company_name !== req.user.company_name) {
+                return res.status(403).json({ msg: "Access Denied: You can only manage staff within your company" });
+            }
+        }
 
         // Security: Regular Admins can ONLY manage STAFF tier
         if (!isSuperAdminUser(req.user)) {
@@ -3138,7 +4124,7 @@ app.put('/api/staff/:id', authenticateToken, async (req, res) => {
                 return res.status(400).json({ msg: "Email is already in use by another staff member" });
             }
         }
-        let query = 'UPDATE users SET employee_id = ?, name = ?, email = ?, phone = ?, role = ?, tier = ?, designation = ?, domain = ?';
+        let query = 'UPDATE users SET employee_id = ?, name = ?, email = ?, phone = ?, role = ?, tier = ?, designation = ?, domain = ?, user_type = ?, company_name = ?, can_export_copy = ?, can_edit = ?, show_country_menu = ?, is_active = ?';
         let params = [
             employee_id || null,
             name,
@@ -3147,7 +4133,13 @@ app.put('/api/staff/:id', authenticateToken, async (req, res) => {
             role,
             (tier !== undefined && tier !== null) ? tier : before.tier,
             designation || null,
-            domain
+            domain,
+            user_type || before.user_type || 'CORE',
+            company_name || before.company_name,
+            (req.body.can_export_copy !== undefined && req.body.can_export_copy !== null) ? (Number(req.body.can_export_copy) ? 1 : 0) : (before.can_export_copy || 0),
+            (req.body.can_edit !== undefined && req.body.can_edit !== null) ? (Number(req.body.can_edit) ? 1 : 0) : (before.can_edit !== undefined ? before.can_edit : 1),
+            (req.body.show_country_menu !== undefined && req.body.show_country_menu !== null) ? (Number(req.body.show_country_menu) ? 1 : 0) : (before.show_country_menu || 0),
+            (req.body.is_active !== undefined && req.body.is_active !== null) ? (Number(req.body.is_active) ? 1 : 0) : (before.is_active || 1)
         ];
         // 2. Only hash and update password if it's provided
         if (password && password.trim() !== "") {
@@ -3156,7 +4148,7 @@ app.put('/api/staff/:id', authenticateToken, async (req, res) => {
             query += ', password = ?';
             params.push(hashedPassword);
         }
-        query += ' WHERE id = ? AND is_active = 1';
+        query += ' WHERE id = ?';
         params.push(id);
         const [result] = await pool.execute(query, params);
         if (result.affectedRows === 0) {
@@ -3176,6 +4168,18 @@ app.put('/api/staff/:id', authenticateToken, async (req, res) => {
         if ((before.tier || '') !== (tier || '')) historyRows.push([id, 'USER_EDIT', 'tier', before.tier || '', tier || '', changedBy, nowStr]);
         if ((before.designation || '') !== (designation || '')) historyRows.push([id, 'USER_EDIT', 'designation', before.designation || '', designation || '', changedBy, nowStr]);
         if ((before.domain || '') !== (domain || '')) historyRows.push([id, 'USER_EDIT', 'domain', before.domain || '', domain || '', changedBy, nowStr]);
+        if (Number(before.can_export_copy || 0) !== Number(req.body.can_export_copy !== undefined ? req.body.can_export_copy : before.can_export_copy)) {
+            historyRows.push([id, 'USER_EDIT', 'can_export_copy', String(before.can_export_copy || 0), String(req.body.can_export_copy || 0), changedBy, nowStr]);
+        }
+        if (Number(before.show_country_menu || 0) !== Number(req.body.show_country_menu !== undefined ? req.body.show_country_menu : before.show_country_menu)) {
+            historyRows.push([id, 'USER_EDIT', 'show_country_menu', String(before.show_country_menu || 0), String(req.body.show_country_menu || 0), changedBy, nowStr]);
+        }
+        if (Number(before.can_edit !== undefined ? before.can_edit : 1) !== Number(req.body.can_edit !== undefined ? req.body.can_edit : (before.can_edit !== undefined ? before.can_edit : 1))) {
+            historyRows.push([id, 'USER_EDIT', 'can_edit', String(before.can_edit !== undefined ? before.can_edit : 1), String(req.body.can_edit !== undefined ? req.body.can_edit : 1), changedBy, nowStr]);
+        }
+        if (Number(before.is_active) !== Number(req.body.is_active !== undefined ? req.body.is_active : before.is_active)) {
+            historyRows.push([id, 'USER_EDIT', 'is_active', String(before.is_active), String(req.body.is_active || 0), changedBy, nowStr]);
+        }
 
         if (password && password.trim() !== "") historyRows.push([id, 'PASSWORD_RESET', 'password', '********', '********', changedBy, nowStr]);
 
@@ -3196,6 +4200,140 @@ app.put('/api/staff/:id', authenticateToken, async (req, res) => {
         res.status(500).json({ error: "Database update failed: " + err.message });
     }
 });
+
+// 4. GET Staff Personal Details
+app.get('/api/staff/:id/personal-details', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const [rows] = await pool.execute(
+            `SELECT *, 
+             DATE_FORMAT(dob, '%Y-%m-%d') as dob, 
+             DATE_FORMAT(doj, '%Y-%m-%d') as doj 
+             FROM staff_personal_details WHERE user_id = ?`, 
+            [id]
+        );
+        if (rows.length === 0) {
+            return res.status(200).json({}); // No details yet
+        }
+        res.json(rows[0]);
+    } catch (err) {
+        console.error("Fetch personal details error:", err);
+        res.status(500).json({ error: "Failed to fetch personal details" });
+    }
+});
+
+// 5. POST/UPDATE Staff Personal Details
+app.post('/api/staff/:id/personal-details', authenticateToken, (req, res) => {
+    // Wrap multer in a custom handler to catch errors gracefully
+    const cpUpload = uploadStaffDocs.any(); // Use any() to allow dynamic document names
+    cpUpload(req, res, async function (err) {
+        if (err instanceof multer.MulterError) {
+            return res.status(400).json({ msg: `Upload error: ${err.message}` });
+        } else if (err) {
+            return res.status(400).json({ msg: `Upload error: ${err.message}` });
+        }
+
+        const { id } = req.params;
+        const { aadhar_name, personal_email, phone, dob, doj, address, has_experience } = req.body;
+        
+        // Security: Only Admins can edit
+        if (!isAdminUser(req.user)) {
+            return res.status(403).json({ msg: "Access Denied" });
+        }
+
+        try {
+            const [userRows] = await pool.execute('SELECT id FROM users WHERE id = ?', [id]);
+            if (userRows.length === 0) return res.status(404).json({ msg: "User not found" });
+
+            const [existing] = await pool.execute('SELECT * FROM staff_personal_details WHERE user_id = ?', [id]);
+            
+            // Helper to find file path by fieldname
+            const getFilePath = (fieldName) => {
+                const file = req.files && req.files.find(f => f.fieldname === fieldName);
+                return file ? file.path : null;
+            };
+
+            let resume_path = getFilePath('resume') || existing[0]?.resume_path || null;
+            let aadhar_path = getFilePath('aadhar') || existing[0]?.aadhar_path || null;
+            let pan_path = getFilePath('pan') || existing[0]?.pan_path || null;
+            let degree_path = getFilePath('degree') || existing[0]?.degree_path || null;
+            let experience_path = getFilePath('experience_cert') || existing[0]?.experience_path || null;
+            
+            // Handle dynamic other docs
+            let otherDocsArray = [];
+            if (existing.length > 0 && existing[0].other_doc_path) {
+                try {
+                    otherDocsArray = JSON.parse(existing[0].other_doc_path);
+                } catch (e) {
+                    // Ignore if not JSON
+                }
+            }
+
+            // Find all newly uploaded files that start with 'other_doc_'
+            const newOtherDocs = req.files ? req.files.filter(f => f.fieldname.startsWith('other_doc_')) : [];
+            newOtherDocs.forEach(file => {
+                // The fieldname might be "other_doc_SomeName"
+                const docName = file.fieldname.replace('other_doc_', '');
+                otherDocsArray.push({
+                    name: docName,
+                    path: file.path
+                });
+            });
+
+            // Also check if any existing other docs were requested to be deleted (handled optionally via req.body.delete_other_docs)
+            if (req.body.delete_other_docs) {
+                const toDelete = JSON.parse(req.body.delete_other_docs);
+                otherDocsArray = otherDocsArray.filter(doc => !toDelete.includes(doc.path));
+            }
+
+            let other_doc_path = JSON.stringify(otherDocsArray);
+
+            // Required check for new records
+            if (existing.length === 0) {
+                if (!resume_path || !aadhar_path || !pan_path || !degree_path) {
+                    return res.status(400).json({ msg: "Missing mandatory documents (Resume, Aadhar, PAN, Degree)" });
+                }
+                if (String(has_experience) === '1' || String(has_experience) === 'true') {
+                    if (!experience_path) {
+                        return res.status(400).json({ msg: "Experience certificate is required since experience is marked as yes." });
+                    }
+                }
+            }
+
+            const expVal = (String(has_experience) === '1' || String(has_experience) === 'true') ? 1 : 0;
+
+            if (existing.length === 0) {
+                await pool.execute(
+                    `INSERT INTO staff_personal_details (
+                        user_id, aadhar_name, personal_email, phone, dob, doj, address, has_experience,
+                        resume_path, aadhar_path, pan_path, degree_path, experience_path, other_doc_path
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [
+                        id, aadhar_name, personal_email, phone, dob, doj, address, expVal,
+                        resume_path, aadhar_path, pan_path, degree_path, experience_path, other_doc_path
+                    ]
+                );
+            } else {
+                await pool.execute(
+                    `UPDATE staff_personal_details SET
+                        aadhar_name = ?, personal_email = ?, phone = ?, dob = ?, doj = ?, address = ?, has_experience = ?,
+                        resume_path = ?, aadhar_path = ?, pan_path = ?, degree_path = ?, experience_path = ?, other_doc_path = ?
+                    WHERE user_id = ?`,
+                    [
+                        aadhar_name, personal_email, phone, dob, doj, address, expVal,
+                        resume_path, aadhar_path, pan_path, degree_path, experience_path, other_doc_path, id
+                    ]
+                );
+            }
+
+            res.json({ msg: "Personal details updated successfully" });
+        } catch (err) {
+            console.error("Save personal details error:", err);
+            res.status(500).json({ error: "Failed to save personal details" });
+        }
+    });
+});
+
 // ==========================================
 // 1. DOMAIN ROUTES
 // ==========================================
@@ -3336,6 +4474,16 @@ app.delete('/api/master/system-emails/:id', authenticateToken, async (req, res) 
         await pool.execute('DELETE FROM system_emails WHERE id = ?', [req.params.id]);
         res.json({ msg: "System email deleted" });
     } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET unique agent companies
+app.get('/api/master/agent-companies', authenticateToken, async (req, res) => {
+    try {
+        const [rows] = await pool.execute("SELECT DISTINCT company_name FROM users WHERE user_type = 'AGENT' AND company_name IS NOT NULL AND company_name != '' ORDER BY company_name ASC");
+        res.json(rows.map(r => r.company_name));
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ==========================================
@@ -3520,7 +4668,7 @@ app.delete('/api/leads/:id', authenticateToken, async (req, res) => {
             : (req.user?.name || 'System');
         // Soft delete: keep row in DB and just mark it inactive
         const [result] = await pool.query(
-            'UPDATE leads SET is_active = 0, deleted_at = NOW(), deleted_by = ?, deleted_remarks = ? WHERE id = ?',
+            'UPDATE leads SET is_active = 0, deleted_at = NOW(), deleted_by = ?, deletion_remark = ? WHERE id = ?',
             [deletedBy, remarks || null, id]
         );
         if (result.affectedRows === 0) {
@@ -3590,7 +4738,7 @@ app.delete('/api/admin/leads/permanent-delete', authenticateToken, async (req, r
         await pool.query('DELETE FROM lead_remarks_messages WHERE lead_id IN (?)', [ids]);
         await pool.query('DELETE FROM lead_remarks_messages_history WHERE lead_id IN (?)', [ids]);
         await pool.query('DELETE FROM lead_edit_history WHERE lead_id IN (?)', [ids]);
-        
+
         const [result] = await pool.query('DELETE FROM leads WHERE id IN (?) AND is_active = 0', [ids]);
         res.status(200).json({ message: `${result.affectedRows} records permanently deleted.` });
     } catch (err) {
@@ -3623,12 +4771,12 @@ app.get('/api/master/documents', authenticateToken, async (req, res) => {
     try {
         const [docs] = await pool.execute('SELECT * FROM master_documentation ORDER BY document_name ASC');
         const [mappings] = await pool.execute('SELECT * FROM master_documentation_mappings');
-        
+
         const result = docs.map(d => ({
             ...d,
             access_configs: mappings.filter(m => m.doc_id === d.id)
         }));
-        
+
         res.json(result);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -3636,7 +4784,7 @@ app.get('/api/master/documents', authenticateToken, async (req, res) => {
 app.post('/api/master/documents', authenticateToken, async (req, res) => {
     if (!isAdminUser(req.user)) return res.status(403).json({ msg: "Admin only" });
     const { documentName, isMandatory, access_configs } = req.body;
-    
+
     let connection;
     try {
         connection = await pool.getConnection();
@@ -3671,7 +4819,7 @@ app.put('/api/master/documents/:id', authenticateToken, async (req, res) => {
     if (!isAdminUser(req.user)) return res.status(403).json({ msg: "Admin only" });
     const { id } = req.params;
     const { documentName, isMandatory, access_configs } = req.body;
-    
+
     let connection;
     try {
         connection = await pool.getConnection();
@@ -3722,7 +4870,7 @@ app.get('/api/master/documents/:level/:parentId', authenticateToken, async (req,
             FROM master_documentation d
             JOIN master_documentation_mappings m ON d.id = m.doc_id
             WHERE `;
-        
+
         let params = [];
         if (level === 'domain') {
             sql += 'm.domain_id = ? AND m.category_id IS NULL AND m.value_id IS NULL';
@@ -3767,7 +4915,7 @@ app.get('/api/leads/:id/document-requirements', authenticateToken, async (req, r
 
         // Domain ID
         const [domainRows] = await pool.execute(
-            'SELECT id FROM master_domains WHERE LOWER(name) LIKE LOWER(?) OR LOWER(?) LIKE CONCAT("%", LOWER(name), "%")', 
+            'SELECT id FROM master_domains WHERE LOWER(name) LIKE LOWER(?) OR LOWER(?) LIKE CONCAT("%", LOWER(name), "%")',
             [`%${normalizedDomain}%`, normalizedDomain]
         );
         const domainId = domainRows[0]?.id;
@@ -3776,7 +4924,7 @@ app.get('/api/leads/:id/document-requirements', authenticateToken, async (req, r
         let categoryId = null;
         if (lead.category && lead.category !== 'Mobile Enquiry') {
             const [catRows] = await pool.execute(
-                'SELECT id FROM master_categories WHERE LOWER(category_name) LIKE LOWER(?) OR LOWER(?) LIKE CONCAT("%", LOWER(category_name), "%")', 
+                'SELECT id FROM master_categories WHERE LOWER(category_name) LIKE LOWER(?) OR LOWER(?) LIKE CONCAT("%", LOWER(category_name), "%")',
                 [`%${lead.category}%`, lead.category]
             );
             categoryId = catRows[0]?.id;
@@ -3786,7 +4934,7 @@ app.get('/api/leads/:id/document-requirements', authenticateToken, async (req, r
         let valueId = null;
         if (lead.interested_in) {
             const [valRows] = await pool.execute(
-                'SELECT id FROM master_values WHERE LOWER(sub_value) LIKE LOWER(?) OR LOWER(?) LIKE CONCAT("%", LOWER(sub_value), "%")', 
+                'SELECT id FROM master_values WHERE LOWER(sub_value) LIKE LOWER(?) OR LOWER(?) LIKE CONCAT("%", LOWER(sub_value), "%")',
                 [`%${lead.interested_in}%`, lead.interested_in]
             );
             valueId = valRows[0]?.id;
@@ -3834,7 +4982,7 @@ app.post('/api/leads/:id/documents/upload', authenticateToken, uploadDocuments.s
 
     try {
         const filePath = `uploads/documents/${req.file.filename}`;
-        
+
         // We use an UPSERT style logic: if requirementId exists for this lead, update it.
         // If no requirementId (ad-hoc), we always insert.
         if (requirementId) {
@@ -3842,7 +4990,7 @@ app.post('/api/leads/:id/documents/upload', authenticateToken, uploadDocuments.s
                 'SELECT id FROM lead_documents WHERE lead_id = ? AND requirement_id = ?',
                 [id, requirementId]
             );
-            
+
             if (existing.length > 0) {
                 await pool.execute(
                     `UPDATE lead_documents 
@@ -3931,18 +5079,18 @@ app.delete('/api/leads/:id/documents/:docId', authenticateToken, async (req, res
 // EDIT LEAD (UPDATE)
 app.put('/api/leads/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
-    const { student_name, email, phone, category, interested_in } = req.body;
+    const { student_name, email, phone, category, interested_in, intake } = req.body;
     try {
         const [beforeRows] = await pool.query(
-            'SELECT student_name, email, phone, category, interested_in FROM leads WHERE id = ?',
+            'SELECT student_name, email, phone, category, interested_in, intake FROM leads WHERE id = ?',
             [id]
         );
         if (beforeRows.length === 0) {
             return res.status(404).json({ message: "Lead not found" });
         }
         const before = beforeRows[0];
-        const sql = `UPDATE leads SET student_name=?, email=?, phone=?, category=?, interested_in=? WHERE id=?`;
-        const [result] = await pool.query(sql, [student_name, email, phone, category, interested_in, id]);
+        const sql = `UPDATE leads SET student_name=?, email=?, phone=?, category=?, interested_in=?, intake=? WHERE id=?`;
+        const [result] = await pool.query(sql, [student_name, email, phone, category, interested_in, intake, id]);
         if (result.affectedRows === 0) {
             return res.status(404).json({ message: "Lead not found" });
         }
@@ -3953,6 +5101,7 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
         if ((before.phone || '') !== (phone || '')) historyRows.push([id, 'LEAD_EDIT', 'phone', before.phone || '', phone || '', changedBy]);
         if ((before.category || '') !== (category || '')) historyRows.push([id, 'LEAD_EDIT', 'category', before.category || '', category || '', changedBy]);
         if ((before.interested_in || '') !== (interested_in || '')) historyRows.push([id, 'LEAD_EDIT', 'interested_in', before.interested_in || '', interested_in || '', changedBy]);
+        if ((before.intake || '') !== (intake || '')) historyRows.push([id, 'LEAD_EDIT', 'intake', before.intake || '', intake || '', changedBy]);
         for (const h of historyRows) {
             await pool.query(
                 `INSERT INTO lead_edit_history (lead_id, action_type, field_name, old_value, new_value, changed_by)
@@ -3968,7 +5117,7 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
 });
 
 app.get('/api/dashboard/enquiry-trends', authenticateToken, async (req, res) => {
-    const { range = 'week', domain: selectedDomain = 'All', startDate, endDate, date: specificDate, tzOffset } = req.query;
+    const { range = 'week', domain: selectedDomain = 'All', startDate, endDate, date: specificDate, tzOffset, source_type, company_name } = req.query;
     const { userId: filterUserId } = req.query;
     const isSuperAdmin = isSuperAdminUser(req.user);
     const { domain: userDomain, id: loggedUserId } = req.user;
@@ -3976,11 +5125,11 @@ app.get('/api/dashboard/enquiry-trends', authenticateToken, async (req, res) => 
     try {
         const combinedBase = `
             (
-                SELECT domain, status, created_at, assigned_to
+                SELECT domain, status, created_at, assigned_to, source_type, company_name
                 FROM leads
                 WHERE is_active = 1
                 UNION ALL
-                SELECT service_type AS domain, 'New' AS status, created_at, NULL AS assigned_to
+                SELECT service_type AS domain, 'New' AS status, created_at, NULL AS assigned_to, 'Mobile' AS source_type, NULL AS company_name
                 FROM bgoi_enquiries e
                 WHERE NOT EXISTS (
                     SELECT 1 FROM leads l 
@@ -3991,6 +5140,23 @@ app.get('/api/dashboard/enquiry-trends', authenticateToken, async (req, res) => 
 
         let where = " WHERE 1=1";
         const params = [];
+
+        // 0. Source/Company Filter
+        if (source_type && source_type !== 'All') {
+            if (source_type === 'Agent') {
+                where += " AND (combined.source_type = 'Agent' OR (combined.company_name IS NOT NULL AND combined.company_name NOT IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions')))";
+            } else if (source_type === 'Own') {
+                where += " AND (combined.source_type = 'Own' OR combined.source_type IS NULL OR combined.source_type = '') AND (combined.company_name IS NULL OR combined.company_name IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions'))";
+            } else {
+                where += ' AND combined.source_type = ?';
+                params.push(source_type);
+            }
+        }
+
+        if (company_name && company_name !== 'All') {
+            where += ' AND company_name = ?';
+            params.push(company_name);
+        }
 
         // 1. Staff/User Filter
         if (filterUserId && filterUserId !== 'All') {
@@ -4047,7 +5213,8 @@ app.get('/api/dashboard/enquiry-trends', authenticateToken, async (req, res) => 
                 ${selectLabel} as label,
                 COUNT(*) as total,
                 SUM(CASE WHEN status = 'Follow Up' THEN 1 ELSE 0 END) as followup,
-                SUM(CASE WHEN status = 'Enrolled' THEN 1 ELSE 0 END) as enrolled
+                SUM(CASE WHEN status = 'Enrolled' THEN 1 ELSE 0 END) as enrolled,
+                SUM(CASE WHEN status = 'Dropped' THEN 1 ELSE 0 END) as dropped
             FROM ${combinedBase}
             ${where}
             GROUP BY ${groupBy}
@@ -4067,6 +5234,7 @@ app.get('/api/dashboard/enquiry-trends', authenticateToken, async (req, res) => 
                     pending: 0,
                     followup: 0,
                     enrolled: 0,
+                    dropped: 0,
                     total: 0
                 });
             }
@@ -4134,7 +5302,7 @@ app.get('/api/dashboard/trends-daily', async (req, res) => {
 // NEW: GET Staff List for Dashboard Dropdown
 // NEW: GET Staff List for Dashboard Dropdown
 app.get('/api/dashboard/staff-list', authenticateToken, async (req, res) => {
-    const { domain: selectedDomain } = req.query;
+    const { domain: selectedDomain, source_type, company_name } = req.query;
     const isSuperAdmin = isSuperAdminUser(req.user);
     const { domain: userDomain } = req.user;
 
@@ -4142,21 +5310,40 @@ app.get('/api/dashboard/staff-list', authenticateToken, async (req, res) => {
         let sql = "SELECT id, name, domain, role, tier FROM users WHERE is_active = 1";
         const params = [];
 
+        if (source_type && source_type !== 'All') {
+            if (source_type === 'Agent') {
+                sql += " AND company_name IS NOT NULL AND company_name NOT IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions')";
+            } else if (source_type === 'Own') {
+                sql += " AND (company_name IS NULL OR company_name IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions'))";
+            }
+        }
+
+        if (company_name && company_name !== 'All') {
+            sql += " AND company_name = ?";
+            params.push(company_name);
+        }
+
         if (!isSuperAdmin) {
             // Non-super-admins see users within their authorized domains
-            const authorized = getDomainAliases(userDomain);
+            const userType = req.user.user_type || 'CORE';
+            if (userType === 'AGENT' || userType === 'FRANCHISE') {
+                sql += " AND company_name = ?";
+                params.push(req.user.company_name);
+            } else {
+                const authorized = getDomainAliases(userDomain);
 
-            if (selectedDomain && selectedDomain !== 'All') {
-                const requested = getDomainAliases(selectedDomain);
-                const hasAccess = requested.every(r => authorized.includes(r));
+                if (selectedDomain && selectedDomain !== 'All') {
+                    const requested = getDomainAliases(selectedDomain);
+                    const hasAccess = requested.every(r => authorized.includes(r));
 
-                if (hasAccess) {
-                    sql = appendDomainCondition(sql, params, selectedDomain);
+                    if (hasAccess) {
+                        sql = appendDomainCondition(sql, params, selectedDomain);
+                    } else {
+                        sql = appendDomainCondition(sql, params, userDomain);
+                    }
                 } else {
                     sql = appendDomainCondition(sql, params, userDomain);
                 }
-            } else {
-                sql = appendDomainCondition(sql, params, userDomain);
             }
         } else if (selectedDomain && selectedDomain !== 'All') {
             sql = appendDomainCondition(sql, params, selectedDomain);
@@ -4396,6 +5583,749 @@ app.get('/api/admin/efficiency-report', authenticateToken, async (req, res) => {
         console.error("Efficiency Report API Error:", err);
         res.status(500).json({ error: err.message });
     }
+});
+
+
+// ================= META WEBHOOK LEAD INTEGRATION =================
+const META_VERIFY_TOKEN = "mycrmverify123";
+const META_ACCESS_TOKEN = "EAAeDhwLj4GYBRk1wsXhwRHqU7chqv9DmY4uZCyRYGNUYiwl9te6kJtWClQJLrLDIW3tz4wb7oI5HDw4VqieCGZAhYX9Q4scU69zxuZBZBCUIVCySeYDuMG0vH8lqejd1d3euaN3VxdygqdqCi41afl4ybCj7Gn2mGKVEHdV9aY1sVQlvjHKUAqeyHt6QnSLSa9SWuJvY";
+
+const META_PAGE_DOMAIN_MAP = {
+  "443339626098796": "Bluestone Overseas",
+  "884912191368488": "Bluestone Techpark",
+  "835486679651886": "Bluestone International Pre School",
+  "902355596291561": "Bluestone Group of Institutions",
+  "960652620453721": "Bluestone Placements",
+  "798882103317956": "Bluestone Language Hub",
+  "794545177065914": "Bluestone Elite Sports",
+  "748860194967018": "Bluestoneiasacademy"
+};
+
+app.get('/meta-webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode === 'subscribe' && token === META_VERIFY_TOKEN) {
+    console.log("Meta webhook verification successful via server.js!");
+    return res.status(200).send(challenge);
+  } else {
+    console.warn(`Meta Webhook verification failed. Token mismatch.`);
+    return res.sendStatus(403);
+  }
+});
+
+app.post('/meta-webhook', async (req, res) => {
+  console.log("🚀 DEBUG 1: Webhook route triggered raw body:", JSON.stringify(req.body));
+
+  try {
+    const change = req.body.entry?.[0]?.changes?.[0];
+    const leadgen_id = change?.value?.leadgen_id;
+    const page_id = change?.value?.page_id || req.body.entry?.[0]?.id;
+
+    if (!leadgen_id) {
+      console.log("❌ DEBUG 2: Dropped request because no leadgen_id was found in payload.");
+      return res.sendStatus(200);
+    }
+
+    // 1. Dynamically find the target brand domain mapping based on incoming Page ID
+    let targetDomain = "Bluestone Overseas"; // Default fallback
+    if (page_id && META_PAGE_DOMAIN_MAP[page_id]) {
+      targetDomain = META_PAGE_DOMAIN_MAP[page_id];
+    }
+
+    console.log(`✅ DEBUG 3: Extracted Leadgen ID: ${leadgen_id} | Dynamic Destination Brand: "${targetDomain}"`);
+
+    // Fetch details from Meta Graph API
+    console.log("🔄 DEBUG 4: Sending request to Meta Graph API...");
+    const response = await axios.get(
+      `https://graph.facebook.com/v25.0/${leadgen_id}`,
+      { params: { access_token: META_ACCESS_TOKEN } }
+    );
+    console.log("✅ DEBUG 5: Meta Graph API Response received.");
+
+    const fieldData = response.data.field_data;
+    if (!fieldData) {
+      console.warn("❌ DEBUG 6: Meta returned response but field_data array is completely missing.");
+      return res.sendStatus(200);
+    }
+
+    let lead = {};
+    fieldData.forEach(field => {
+      lead[field.name] = field.values[0];
+    });
+
+    const finalLead = {
+      name: lead.full_name || lead.name || 'Meta User',
+      email: lead.email || '',
+      phone: lead.phone_number || lead.phone || '',
+      source: 'Facebook Ads'
+    };
+    console.log("📊 DEBUG 7: Flattened Lead object ready for database:", finalLead);
+
+    console.log(`🔄 DEBUG 8: Getting next lead code sequence for dynamic brand: "${targetDomain}"...`);
+    const leadCode = await getNextLeadCode(targetDomain); // FIXED: No longer hardcoded
+    console.log(`✅ DEBUG 9: Lead Code assigned: ${leadCode}`);
+
+    const nowStr = getISTString();
+    const insertQuery = `
+      INSERT INTO leads (student_name, email, phone, source, domain, status, lead_code, is_active, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+    `;
+
+    console.log(`🔄 DEBUG 10: Executing Database Insert Query for brand: "${targetDomain}"...`);
+    await pool.execute(insertQuery, [
+      finalLead.name,
+      finalLead.email,
+      finalLead.phone,
+      finalLead.source,
+      targetDomain, // FIXED: No longer hardcoded
+      'New',
+      leadCode,
+      nowStr
+    ]);
+    
+    console.log("🎉 DEBUG 11: SUCCESS! Database write confirmed.");
+    
+    // Trigger dynamic notifications
+    triggerEmails(finalLead.name, finalLead.email, finalLead.phone, 'Meta Lead Ads Enquiry', targetDomain, 'Meta Lead Ads', 'Facebook Ads');
+    
+    res.sendStatus(200);
+
+  } catch (error) {
+    console.error("🚨 CRITICAL BREAKDOWN LOGGED:");
+    if (error.response) {
+      console.error("Meta Graph API Server Error Details:", error.response.data);
+    } else {
+      console.error("Local Script/Database Error Message:", error.message);
+    }
+    res.sendStatus(200); // Keep sending 200 to Meta so they don't break your webhook connection stream
+  }
+});
+
+// ==========================================
+// ASSET MANAGEMENT APIs
+// ==========================================
+
+// GET all assets with assigned user details
+app.get('/api/assets', authenticateToken, async (req, res) => {
+    try {
+        const query = `
+            SELECT a.*, u.name as assigned_to_name
+            FROM assets a
+            LEFT JOIN users u ON a.assigned_to = u.id
+            ORDER BY a.created_at DESC
+        `;
+        const [rows] = await pool.execute(query);
+        res.json(rows);
+    } catch (err) {
+        console.error("Error fetching assets:", err);
+        res.status(500).json({ msg: "Failed to fetch assets" });
+    }
+});
+
+// POST new asset
+app.post('/api/assets', authenticateToken, async (req, res) => {
+    try {
+        const { category, asset_name, brand, model, login_username, login_password, approx_value, assigned_to, custom_assigned_name, has_charger } = req.body;
+        
+        if (!category) return res.status(400).json({ msg: "Category is required" });
+
+        const query = `
+            INSERT INTO assets (category, asset_name, brand, model, login_username, login_password, approx_value, assigned_to, custom_assigned_name, has_charger)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+        
+        const params = [
+            category, 
+            asset_name || null, 
+            brand || null, 
+            model || null, 
+            login_username || null, 
+            login_password || null, 
+            approx_value || null, 
+            assigned_to || null,
+            custom_assigned_name || null,
+            has_charger ? 1 : 0
+        ];
+
+        const [result] = await pool.execute(query, params);
+        const newId = result.insertId;
+
+        // Log history
+        await pool.execute(
+            "INSERT INTO asset_history (asset_id, action_type, changed_by, change_details) VALUES (?, ?, ?, ?)",
+            [newId, 'CREATED', req.user.id, `Asset created in category: ${category}`]
+        );
+
+        res.status(201).json({ msg: "Asset added successfully" });
+    } catch (err) {
+        console.error("Error adding asset:", err);
+        res.status(500).json({ msg: "Failed to add asset" });
+    }
+});
+
+// PUT update asset
+app.put('/api/assets/:id', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { category, asset_name, brand, model, login_username, login_password, approx_value, assigned_to, custom_assigned_name, has_charger } = req.body;
+
+        // Fetch old values for history comparison
+        const [oldRows] = await pool.execute("SELECT * FROM assets WHERE id = ?", [id]);
+        if (oldRows.length === 0) return res.status(404).json({ msg: "Asset not found" });
+        const old = oldRows[0];
+
+        // Compare fields to detect specific changes
+        let changes = [];
+        const compare = (field, label, newVal, oldVal) => {
+            // Trim and normalize values
+            const nV = (newVal === undefined || newVal === null) ? "" : String(newVal).trim();
+            const oV = (oldVal === undefined || oldVal === null) ? "" : String(oldVal).trim();
+            
+            // Special handling for booleans/bit fields
+            const finalNV = (field === 'has_charger') ? (newVal ? 1 : 0) : nV;
+            const finalOV = (field === 'has_charger') ? (oldVal ? 1 : 0) : oV;
+
+            if (String(finalNV) !== String(finalOV)) {
+                // For numeric values, compare as numbers to avoid .00 issues
+                if (field === 'approx_value') {
+                    if (Number(newVal) === Number(oldVal)) return;
+                }
+
+                const from = (field === 'has_charger') ? (finalOV ? 'Yes' : 'No') : (oldVal || 'N/A');
+                const to = (field === 'has_charger') ? (finalNV ? 'Yes' : 'No') : (newVal || 'N/A');
+                changes.push(`${label}: ${from} ➔ ${to}`);
+            }
+        };
+
+        compare('category', 'Category', category, old.category);
+        compare('brand', 'Brand', brand, old.brand);
+        compare('model', 'Model', model, old.model);
+        compare('asset_name', 'Item Name', asset_name, old.asset_name);
+        compare('login_username', 'Login User', login_username, old.login_username);
+        compare('approx_value', 'Value', approx_value, old.approx_value);
+        compare('custom_assigned_name', 'Assigned Name', custom_assigned_name, old.custom_assigned_name);
+        compare('has_charger', 'Charger', has_charger, old.has_charger);
+        
+        // Handle staff assignment with names
+        if (String(assigned_to || "") !== String(old.assigned_to || "")) {
+            let oldStaffName = "Unassigned";
+            let newStaffName = "Unassigned";
+            
+            if (old.assigned_to) {
+                const [u] = await pool.execute("SELECT name FROM users WHERE id = ?", [old.assigned_to]);
+                if (u.length > 0) oldStaffName = u[0].name;
+            }
+            if (assigned_to) {
+                const [u] = await pool.execute("SELECT name FROM users WHERE id = ?", [assigned_to]);
+                if (u.length > 0) newStaffName = u[0].name;
+            }
+            changes.push(`Assigned Staff: ${oldStaffName} ➔ ${newStaffName}`);
+        }
+
+        const changeMessage = changes.length > 0 ? changes.join(" | ") : "Saved without changes";
+
+        const query = `
+            UPDATE assets 
+            SET category = ?, asset_name = ?, brand = ?, model = ?, login_username = ?, login_password = ?, approx_value = ?, assigned_to = ?, custom_assigned_name = ?, has_charger = ?
+            WHERE id = ?
+        `;
+        
+        const params = [
+            category, 
+            asset_name || null, 
+            brand || null, 
+            model || null, 
+            login_username || null, 
+            login_password || null, 
+            approx_value || null, 
+            assigned_to || null,
+            custom_assigned_name || null,
+            has_charger ? 1 : 0,
+            id
+        ];
+
+        await pool.execute(query, params);
+
+        // Log detailed history
+        await pool.execute(
+            "INSERT INTO asset_history (asset_id, action_type, changed_by, change_details) VALUES (?, ?, ?, ?)",
+            [id, 'UPDATED', req.user.id, changeMessage]
+        );
+
+        res.json({ msg: "Asset updated successfully" });
+    } catch (err) {
+        console.error("Error updating asset:", err);
+        res.status(500).json({ msg: "Failed to update asset" });
+    }
+});
+
+// DELETE asset
+app.delete('/api/assets/:id', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        await pool.execute("DELETE FROM assets WHERE id = ?", [id]);
+        res.json({ msg: "Asset deleted successfully" });
+    } catch (err) {
+        console.error("Error deleting asset:", err);
+        res.status(500).json({ msg: "Failed to delete asset" });
+    }
+});
+
+// GET asset history
+app.get('/api/assets/:id/history', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const query = `
+            SELECT h.*, u.name as user_name
+            FROM asset_history h
+            LEFT JOIN users u ON h.changed_by = u.id
+            WHERE h.asset_id = ?
+            ORDER BY h.created_at DESC
+        `;
+        const [rows] = await pool.execute(query, [id]);
+        res.json(rows);
+    } catch (err) {
+        console.error("Error fetching asset history:", err);
+        res.status(500).json({ msg: "Failed to fetch history" });
+    }
+});
+
+// GET all learning countries
+app.get('/api/learning-countries', authenticateToken, async (req, res) => {
+    try {
+        const [rows] = await pool.execute('SELECT * FROM learning_countries ORDER BY name ASC');
+        res.json(rows);
+    } catch (err) {
+        console.error("Fetch countries error:", err);
+        res.status(500).json({ error: "Failed to fetch countries" });
+    }
+});
+
+// POST add learning country (Super Admin only)
+app.post('/api/learning-countries', authenticateToken, async (req, res) => {
+    const isSuperAdmin = req.user.tier === 'SUPER_ADMIN' || ['Main Admin', 'MD', 'GM', 'Super Admin'].includes(req.user.role);
+    if (!isSuperAdmin) {
+        return res.status(403).json({ msg: "Only Super Admins can add countries." });
+    }
+
+    const { code, name, flag } = req.body;
+    if (!code || !name || !flag) {
+        return res.status(400).json({ msg: "Missing code, name, or flag" });
+    }
+
+    try {
+        const normalizedCode = String(code).trim().toLowerCase().replace(/\s+/g, '-');
+        await pool.execute(
+            'INSERT INTO learning_countries (code, name, flag) VALUES (?, ?, ?)',
+            [normalizedCode, name.trim(), flag.trim()]
+        );
+        res.status(201).json({ msg: "Country added successfully!" });
+    } catch (err) {
+        if (err.code === 'ER_DUP_ENTRY') {
+            return res.status(400).json({ msg: "A country with this code already exists." });
+        }
+        console.error("Add country error:", err);
+        res.status(500).json({ error: "Failed to add country" });
+    }
+});
+
+// DELETE learning country (Super Admin only)
+app.delete('/api/learning-countries/:id', authenticateToken, async (req, res) => {
+    const isSuperAdmin = req.user.tier === 'SUPER_ADMIN' || ['Main Admin', 'MD', 'GM', 'Super Admin'].includes(req.user.role);
+    if (!isSuperAdmin) {
+        return res.status(403).json({ msg: "Only Super Admins can delete countries." });
+    }
+
+    const { id } = req.params;
+    try {
+        await pool.execute('DELETE FROM learning_countries WHERE id = ?', [id]);
+        res.json({ msg: "Country deleted successfully!" });
+    } catch (err) {
+        console.error("Delete country error:", err);
+        res.status(500).json({ error: "Failed to delete country" });
+    }
+});
+
+// GET all learning categories (optionally isolated by country_code)
+app.get('/api/learning-categories', authenticateToken, async (req, res) => {
+    const { country_code } = req.query;
+    try {
+        let rows;
+        if (country_code) {
+            [rows] = await pool.execute(
+                'SELECT * FROM learning_categories WHERE country_code = ? OR country_code IS NULL ORDER BY id ASC',
+                [country_code]
+            );
+        } else {
+            [rows] = await pool.execute('SELECT * FROM learning_categories ORDER BY id ASC');
+        }
+        res.json(rows);
+    } catch (err) {
+        console.error("Fetch categories error:", err);
+        res.status(500).json({ error: "Failed to fetch categories" });
+    }
+});
+
+// POST add learning category (Super Admin only, specific to country_code)
+app.post('/api/learning-categories', authenticateToken, async (req, res) => {
+    const isSuperAdmin = req.user.tier === 'SUPER_ADMIN' || ['Main Admin', 'MD', 'GM', 'Super Admin'].includes(req.user.role);
+    if (!isSuperAdmin) {
+        return res.status(403).json({ msg: "Only Super Admins can add categories." });
+    }
+
+    const { name, country_code } = req.body;
+    if (!name) {
+        return res.status(400).json({ msg: "Category name is required" });
+    }
+
+    try {
+        const code = String(name).trim().toLowerCase().replace(/\s+/g, '-');
+        await pool.execute(
+            'INSERT INTO learning_categories (code, name, country_code) VALUES (?, ?, ?)',
+            [code, name.trim(), country_code || null]
+        );
+        res.status(201).json({ msg: "Category added successfully!" });
+    } catch (err) {
+        if (err.code === 'ER_DUP_ENTRY') {
+            return res.status(400).json({ msg: "A category folder with this name already exists." });
+        }
+        console.error("Add category error:", err);
+        res.status(500).json({ error: "Failed to add category" });
+    }
+});
+
+// DELETE learning category (Super Admin only)
+app.delete('/api/learning-categories/:id', authenticateToken, async (req, res) => {
+    const isSuperAdmin = req.user.tier === 'SUPER_ADMIN' || ['Main Admin', 'MD', 'GM', 'Super Admin'].includes(req.user.role);
+    if (!isSuperAdmin) {
+        return res.status(403).json({ msg: "Only Super Admins can delete categories." });
+    }
+
+    const { id } = req.params;
+    try {
+        await pool.execute('DELETE FROM learning_categories WHERE id = ?', [id]);
+        res.json({ msg: "Category deleted successfully!" });
+    } catch (err) {
+        console.error("Delete category error:", err);
+        res.status(500).json({ error: "Failed to delete category" });
+    }
+});
+
+// GET all learning resources
+app.get('/api/learning-resources', authenticateToken, async (req, res) => {
+    try {
+        const [rows] = await pool.execute('SELECT * FROM learning_resources ORDER BY id DESC');
+        res.json(rows);
+    } catch (err) {
+        console.error("Fetch learning resources error:", err);
+        res.status(500).json({ error: "Failed to fetch learning resources" });
+    }
+});
+
+// POST upload new learning resource (Super Admin only)
+app.post('/api/learning-resources/upload', authenticateToken, (req, res) => {
+    // Wrap multer in custom handler to catch errors gracefully
+    const uploadMultiple = uploadDocuments.any();
+    uploadMultiple(req, res, async function (err) {
+        if (err) {
+            console.error("❌ Multer upload error caught:", err);
+        }
+        if (err instanceof multer.MulterError) {
+            return res.status(400).json({ msg: `Upload error: ${err.message}` });
+        } else if (err) {
+            return res.status(400).json({ msg: `Upload error: ${err.message}` });
+        }
+
+        console.log("📝 Upload endpoint request body:", req.body);
+        console.log("📂 Upload endpoint request files count:", req.files ? req.files.length : 0);
+
+        // Security: Only Super Admins can upload resources
+        const isSuperAdmin = req.user.tier === 'SUPER_ADMIN' || ['Main Admin', 'MD', 'GM', 'Super Admin'].includes(req.user.role);
+        if (!isSuperAdmin) {
+            return res.status(403).json({ msg: "Only Super Admins can upload learning resources." });
+        }
+
+        const { country_id, category_id } = req.body;
+        if (!country_id || !category_id) {
+            console.warn("⚠️ Upload failed: Missing country_id or category_id in body:", req.body);
+            return res.status(400).json({ msg: "Missing required fields (country_id, category_id)" });
+        }
+
+        if (!req.files || req.files.length === 0) {
+            console.warn("⚠️ Upload failed: No files found in req.files");
+            return res.status(400).json({ msg: "Please select files to upload" });
+        }
+
+        // Parse custom titles if sent from front-end
+        let titles = [];
+        if (req.body.titles) {
+            try {
+                titles = JSON.parse(req.body.titles);
+            } catch (e) {
+                if (typeof req.body.titles === 'string') {
+                    titles = [req.body.titles];
+                }
+            }
+        }
+
+        try {
+            const dateStr = getISTString().split(' ')[0]; // Returns YYYY-MM-DD
+            const [y, m, d] = dateStr.split('-');
+            const formattedDate = `${d}-${m}-${y}`;
+
+            for (let idx = 0; idx < req.files.length; idx++) {
+                const file = req.files[idx];
+                const sizeInMB = (file.size / (1024 * 1024)).toFixed(2) + " MB";
+                const filePath = `uploads/documents/${file.filename}`;
+                
+                // Get title for this file
+                let finalTitle = titles[idx] || file.originalname;
+                // remove file extension from title if using originalname
+                if (!titles[idx] || titles[idx] === file.originalname) {
+                    const extIndex = file.originalname.lastIndexOf('.');
+                    if (extIndex > 0) {
+                        finalTitle = file.originalname.substring(0, extIndex);
+                    }
+                }
+
+                await pool.execute(
+                    'INSERT INTO learning_resources (country_id, category_id, file_name, file_size, file_date, file_path) VALUES (?, ?, ?, ?, ?, ?)',
+                    [country_id, category_id, finalTitle, sizeInMB, formattedDate, filePath]
+                );
+            }
+
+            res.status(201).json({ msg: "Documents uploaded successfully!" });
+        } catch (dbErr) {
+            console.error("DB Save Error:", dbErr);
+            res.status(500).json({ error: "Failed to save learning resources to database" });
+        }
+    });
+});
+
+// DELETE learning resource (Super Admin only)
+app.delete('/api/learning-resources/:id', authenticateToken, async (req, res) => {
+    // Security: Only Super Admins can delete resources
+    const isSuperAdmin = req.user.tier === 'SUPER_ADMIN' || ['Main Admin', 'MD', 'GM', 'Super Admin'].includes(req.user.role);
+    if (!isSuperAdmin) {
+        return res.status(403).json({ msg: "Only Super Admins can delete learning resources." });
+    }
+
+    const { id } = req.params;
+    try {
+        const [rows] = await pool.execute('SELECT file_path FROM learning_resources WHERE id = ?', [id]);
+        if (rows.length === 0) return res.status(404).json({ msg: "Document not found" });
+
+        const file_path = rows[0].file_path;
+        if (file_path) {
+            const absolutePath = path.join(__dirname, file_path);
+            if (fs.existsSync(absolutePath)) {
+                fs.unlinkSync(absolutePath);
+            }
+        }
+
+        await pool.execute('DELETE FROM learning_resources WHERE id = ?', [id]);
+        res.json({ msg: "Document deleted successfully!" });
+    } catch (err) {
+        console.error("Delete learning resource error:", err);
+        res.status(500).json({ error: "Failed to delete learning resource" });
+    }
+});
+
+// PUT update learning country (Super Admin only)
+app.put('/api/learning-countries/:id', authenticateToken, async (req, res) => {
+    const isSuperAdmin = req.user.tier === 'SUPER_ADMIN' || ['Main Admin', 'MD', 'GM', 'Super Admin'].includes(req.user.role);
+    if (!isSuperAdmin) {
+        return res.status(403).json({ msg: "Only Super Admins can edit countries." });
+    }
+
+    const { id } = req.params;
+    const { code, name, flag } = req.body;
+    if (!code || !name || !flag) {
+        return res.status(400).json({ msg: "Missing code, name, or flag" });
+    }
+
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        // Get old code first to update references
+        const [oldRows] = await connection.execute('SELECT code FROM learning_countries WHERE id = ?', [id]);
+        if (oldRows.length === 0) {
+            await connection.rollback();
+            return res.status(404).json({ msg: "Country not found" });
+        }
+        const oldCode = oldRows[0].code;
+        const newCode = String(code).trim().toLowerCase().replace(/\s+/g, '-');
+
+        // Update country
+        await connection.execute(
+            'UPDATE learning_countries SET code = ?, name = ?, flag = ? WHERE id = ?',
+            [newCode, name.trim(), flag.trim(), id]
+        );
+
+        // Update references if code changed
+        if (oldCode !== newCode) {
+            await connection.execute(
+                'UPDATE learning_categories SET country_code = ? WHERE country_code = ?',
+                [newCode, oldCode]
+            );
+            await connection.execute(
+                'UPDATE learning_resources SET country_id = ? WHERE country_id = ?',
+                [newCode, oldCode]
+            );
+        }
+
+        await connection.commit();
+        res.json({ msg: "Country updated successfully!" });
+    } catch (err) {
+        await connection.rollback();
+        if (err.code === 'ER_DUP_ENTRY') {
+            return res.status(400).json({ msg: "A country with this code already exists." });
+        }
+        console.error("Update country error:", err);
+        res.status(500).json({ error: "Failed to update country" });
+    } finally {
+        connection.release();
+    }
+});
+
+// PUT update learning category (Super Admin only)
+app.put('/api/learning-categories/:id', authenticateToken, async (req, res) => {
+    const isSuperAdmin = req.user.tier === 'SUPER_ADMIN' || ['Main Admin', 'MD', 'GM', 'Super Admin'].includes(req.user.role);
+    if (!isSuperAdmin) {
+        return res.status(403).json({ msg: "Only Super Admins can edit categories." });
+    }
+
+    const { id } = req.params;
+    const { name } = req.body;
+    if (!name) {
+        return res.status(400).json({ msg: "Category name is required" });
+    }
+
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        // Get old category details first
+        const [oldRows] = await connection.execute('SELECT code, country_code FROM learning_categories WHERE id = ?', [id]);
+        if (oldRows.length === 0) {
+            await connection.rollback();
+            return res.status(404).json({ msg: "Category not found" });
+        }
+        const oldCode = oldRows[0].code;
+        const countryCode = oldRows[0].country_code;
+        const newCode = String(name).trim().toLowerCase().replace(/\s+/g, '-');
+
+        // Update category
+        await connection.execute(
+            'UPDATE learning_categories SET code = ?, name = ? WHERE id = ?',
+            [newCode, name.trim(), id]
+        );
+
+        // Update references if code changed
+        if (oldCode !== newCode) {
+            await connection.execute(
+                'UPDATE learning_resources SET category_id = ? WHERE category_id = ? AND country_id = ?',
+                [newCode, oldCode, countryCode]
+            );
+        }
+
+        await connection.commit();
+        res.json({ msg: "Category updated successfully!" });
+    } catch (err) {
+        await connection.rollback();
+        if (err.code === 'ER_DUP_ENTRY') {
+            return res.status(400).json({ msg: "A category folder with this name already exists." });
+        }
+        console.error("Update category error:", err);
+        res.status(500).json({ error: "Failed to update category" });
+    } finally {
+        connection.release();
+    }
+});
+
+// PUT update learning resource/document (Super Admin only - supports replacing title & file)
+app.put('/api/learning-resources/:id', authenticateToken, (req, res) => {
+    const uploadSingle = uploadDocuments.single('file');
+    uploadSingle(req, res, async function (err) {
+        if (err) {
+            console.error("❌ Multer upload error during document edit:", err);
+            return res.status(400).json({ msg: `Upload error: ${err.message}` });
+        }
+
+        const isSuperAdmin = req.user.tier === 'SUPER_ADMIN' || ['Main Admin', 'MD', 'GM', 'Super Admin'].includes(req.user.role);
+        if (!isSuperAdmin) {
+            return res.status(403).json({ msg: "Only Super Admins can edit learning resources." });
+        }
+
+        const { id } = req.params;
+        const { file_name } = req.body;
+        const hasNewFile = Boolean(req.file);
+
+        try {
+            // Fetch old record first to see if we need to delete old file
+            const [oldRows] = await pool.execute('SELECT file_path, file_name FROM learning_resources WHERE id = ?', [id]);
+            if (oldRows.length === 0) {
+                return res.status(404).json({ msg: "Document not found" });
+            }
+            
+            const oldFilePath = oldRows[0].file_path;
+
+            // If a new file is uploaded, process it
+            if (hasNewFile) {
+                const file = req.file;
+                const sizeInMB = (file.size / (1024 * 1024)).toFixed(2) + " MB";
+                const filePath = `uploads/documents/${file.filename}`;
+                
+                const dateStr = getISTString().split(' ')[0]; // Returns YYYY-MM-DD
+                const [y, m, d] = dateStr.split('-');
+                const formattedDate = `${d}-${m}-${y}`;
+
+                // Determine final title: use the new file name if a new one is not explicitly provided in file_name
+                let finalTitle = (file_name || '').trim();
+                if (!finalTitle) {
+                    const extIndex = file.originalname.lastIndexOf('.');
+                    if (extIndex > 0) {
+                        finalTitle = file.originalname.substring(0, extIndex);
+                    } else {
+                        finalTitle = file.originalname;
+                    }
+                }
+
+                // Delete old file from disk
+                if (oldFilePath) {
+                    const absolutePath = path.join(__dirname, oldFilePath);
+                    if (fs.existsSync(absolutePath)) {
+                        fs.unlinkSync(absolutePath);
+                    }
+                }
+
+                // Update database with new file details
+                await pool.execute(
+                    'UPDATE learning_resources SET file_name = ?, file_size = ?, file_date = ?, file_path = ? WHERE id = ?',
+                    [finalTitle, sizeInMB, formattedDate, filePath, id]
+                );
+            } else {
+                // If only editing the title
+                let finalTitle = (file_name || '').trim();
+                if (!finalTitle) {
+                    return res.status(400).json({ msg: "Document title is required" });
+                }
+
+                await pool.execute(
+                    'UPDATE learning_resources SET file_name = ? WHERE id = ?',
+                    [finalTitle, id]
+                );
+            }
+
+            res.json({ msg: "Document updated successfully!" });
+        } catch (dbErr) {
+            console.error("DB Edit Error:", dbErr);
+            res.status(500).json({ error: "Failed to update learning resource details" });
+        }
+    });
 });
 
 

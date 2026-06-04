@@ -29,15 +29,15 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 app.use(cors({
-    origin: '*', 
-    methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 const uploadDir = 'uploads/';
 const imageDir = 'uploads/images/';
 [uploadDir, imageDir].forEach(dir => {
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
 // Static File Access (Crucial for viewing resumes and images)
@@ -47,12 +47,12 @@ app.use('/bgoi_api/uploads', express.static(path.join(__dirname, 'uploads')));
     DATABASE & EMAIL CONFIG
 ================================ */
 const db = mysql.createPool({
-    host: '194.59.164.60', // Resolved from auth-db1278.hstgr.io
-    user: 'u287260207_bgoi_user',
-    password: '4g@LMW2026',
-    database: 'u287260207_bgoi_bg',
-    waitForConnections: true,
-    connectionLimit: 10
+  host: '194.59.164.60', // Resolved from auth-db1278.hstgr.io
+  user: '',
+  password: '',
+  database: '',
+  waitForConnections: true,
+  connectionLimit: 10
 });
 
 // 2. Nodemailer Transporter
@@ -348,15 +348,15 @@ app.post("/api/admin/update-settings", (req, res) => {
 // Multer Config for Media
 
 const imageStorage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, imageDir),
-    filename: (req, file, cb) =>
-        cb(null, `media-${Date.now()}${path.extname(file.originalname)}`),
+  destination: (req, file, cb) => cb(null, imageDir),
+  filename: (req, file, cb) =>
+    cb(null, `media-${Date.now()}${path.extname(file.originalname)}`),
 });
 
 // Adding strict 5MB limit to Multer
-const uploadImage = multer({ 
-    storage: imageStorage,
-    limits: { fileSize:50 * 1024 * 1024 } // 5MB limit
+const uploadImage = multer({
+  storage: imageStorage,
+  limits: { fileSize: 50 * 1024 * 1024 } // 5MB limit
 });
 
 // --- MEDIA ROUTES ---
@@ -365,18 +365,18 @@ const uploadImage = multer({
 
 // Example Express Route
 app.post('/api/media/upload', (req, res) => {
-    const { image, category, alt_text, caption } = req.body; // Expect caption
+  const { image, category, alt_text, caption } = req.body; // Expect caption
 
-    // Ensure LONGTEXT is used in DB to prevent string cutoff
-    const query = "INSERT INTO media (url, category, alt_text, caption) VALUES (?, ?, ?, ?)";
-    
-    db.query(query, [image, category, alt_text, caption || ''], (err, result) => {
-        if (err) {
-            console.error("DB Error:", err);
-            return res.status(500).json({ message: "Database error" });
-        }
-        res.status(200).json({ message: "Uploaded successfully" });
-    });
+  // Ensure LONGTEXT is used in DB to prevent string cutoff
+  const query = "INSERT INTO media (url, category, alt_text, caption) VALUES (?, ?, ?, ?)";
+
+  db.query(query, [image, category, alt_text, caption || ''], (err, result) => {
+    if (err) {
+      console.error("DB Error:", err);
+      return res.status(500).json({ message: "Database error" });
+    }
+    res.status(200).json({ message: "Uploaded successfully" });
+  });
 });
 
 // 2. Fetch by Category
@@ -390,7 +390,7 @@ app.get("/api/media", (req, res) => {
   if (category && category !== 'all') {
     sql += " WHERE category = ?";
     params.push(category);
-    
+
     if (caption) {
       sql += " AND caption = ?";
       params.push(caption);
@@ -401,24 +401,29 @@ app.get("/api/media", (req, res) => {
 
   db.query(sql, params, (err, results) => {
     if (err) return res.status(500).json({ error: err.message });
-    
+
     // IMPORTANT: Do NOT prepend API_BASE_URL if it's a Base64 string
-    res.json(results || []); 
+    res.json(results || []);
   });
 });
 
 // 3. Our People CRUD
 app.get("/api/our_people", (req, res) => {
-  db.query("SELECT * FROM our_people ORDER BY id ASC", (err, results) => {
+  const showAll = req.query.all === "true";
+  const sql = showAll
+    ? "SELECT * FROM our_people ORDER BY id ASC"
+    : "SELECT * FROM our_people WHERE is_active = 1 ORDER BY id ASC";
+  db.query(sql, (err, results) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json(results || []);
   });
 });
 
 app.post("/api/admin/our_people", (req, res) => {
-  const { name, position, image_key, image_data, bio } = req.body;
-  const sql = "INSERT INTO our_people (name, position, image_key, image_data, bio) VALUES (?, ?, ?, ?, ?)";
-  db.query(sql, [name, position, image_key, image_data || '', bio], (err, result) => {
+  const { name, position, image_key, image_data, bio, is_active } = req.body;
+  const activeVal = is_active !== undefined ? is_active : 1;
+  const sql = "INSERT INTO our_people (name, position, image_key, image_data, bio, is_active) VALUES (?, ?, ?, ?, ?, ?)";
+  db.query(sql, [name, position, image_key, image_data || '', bio, activeVal], (err, result) => {
     if (err) return res.status(500).json({ error: err.message });
     res.status(200).json({ success: true, message: "Member added successfully" });
   });
@@ -426,10 +431,11 @@ app.post("/api/admin/our_people", (req, res) => {
 
 app.put("/api/admin/our_people/:id", (req, res) => {
   const { id } = req.params;
-  const { name, position, image_key, image_data, bio } = req.body;
-  
-  const sql = "UPDATE our_people SET name = ?, position = ?, image_key = ?, image_data = ?, bio = ? WHERE id = ?";
-  db.query(sql, [name, position, image_key, image_data || '', bio, id], (err, result) => {
+  const { name, position, image_key, image_data, bio, is_active } = req.body;
+  const activeVal = is_active !== undefined ? is_active : 1;
+
+  const sql = "UPDATE our_people SET name = ?, position = ?, image_key = ?, image_data = ?, bio = ?, is_active = ? WHERE id = ?";
+  db.query(sql, [name, position, image_key, image_data || '', bio, activeVal, id], (err, result) => {
     if (err) return res.status(500).json({ error: err.message });
     if (result.affectedRows === 0) return res.status(404).json({ error: "Member not found" });
     res.json({ success: true, message: "Member updated successfully" });
@@ -464,27 +470,27 @@ app.delete("/api/media/:id", (req, res) => {
   );
 });
 app.put("/api/media/edit/:id", async (req, res) => {
-    const { id } = req.params;
-    const { image, alt_text } = req.body; // Match the keys sent from Frontend
+  const { id } = req.params;
+  const { image, alt_text } = req.body; // Match the keys sent from Frontend
 
-    if (!image) {
-        return res.status(400).json({ error: "No image data provided" });
+  if (!image) {
+    return res.status(400).json({ error: "No image data provided" });
+  }
+
+  // Directly update the database with the already-cropped image string
+  const sql = "UPDATE media SET url = ?, alt_text = ? WHERE id = ?";
+  db.query(sql, [image, alt_text, id], (err, result) => {
+    if (err) {
+      console.error("DB Update Error:", err);
+      return res.status(500).json({ error: "Database update failed" });
     }
 
-    // Directly update the database with the already-cropped image string
-    const sql = "UPDATE media SET url = ?, alt_text = ? WHERE id = ?";
-    db.query(sql, [image, alt_text, id], (err, result) => {
-        if (err) {
-            console.error("DB Update Error:", err);
-            return res.status(500).json({ error: "Database update failed" });
-        }
-        
-        if (result.affectedRows === 0) {
-            return res.status(404).json({ error: "Image not found" });
-        }
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: "Image not found" });
+    }
 
-        res.json({ success: true, message: "Image updated successfully" });
-    });
+    res.json({ success: true, message: "Image updated successfully" });
+  });
 });
 
 app.listen(5002, () =>
