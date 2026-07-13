@@ -9,6 +9,7 @@ const nodemailer = require('nodemailer');
 const fs = require("fs");
 const multer = require("multer");
 const path = require("path");
+const { getMediaFileCategory, compressImageIfNeeded } = require('./mediaCompression');
 const app = express();
 
 // Multer Config for Documents
@@ -86,6 +87,40 @@ const uploadStaffDocs = multer({
         }
     }
 });
+
+// Multer Config for Media Gallery
+const mediaDir = path.join(__dirname, "uploads/media");
+if (!fs.existsSync(mediaDir)) {
+    fs.mkdirSync(mediaDir, { recursive: true });
+}
+const storageMedia = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, "uploads/media"),
+    filename: (req, file, cb) => {
+        const unique = Date.now() + "-" + file.originalname.replace(/\s+/g, '-');
+        cb(null, unique);
+    }
+});
+const uploadMedia = multer({
+    storage: storageMedia,
+    limits: { fileSize: 200 * 1024 * 1024 }, // 200 MB hard cap (enforced per-category in route)
+    fileFilter: (req, file, cb) => {
+        const mime = (file.mimetype || '').toLowerCase();
+        const name = (file.originalname || '').toLowerCase();
+        const imageTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/jpg', 'image/x-png', 'image/svg+xml'];
+        const videoTypes = ['video/mp4', 'video/webm', 'video/quicktime', 'video/x-msvideo', 'video/ogg', 'video/x-m4v'];
+        const docTypes = ['application/pdf', 'application/octet-stream'];
+        const allowedTypes = [...imageTypes, ...videoTypes, ...docTypes];
+        const allowedExtensions = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg', '.mp4', '.webm', '.mov', '.avi', '.pdf'];
+        const hasAllowedMime = allowedTypes.includes(mime);
+        const hasAllowedExtension = allowedExtensions.some(ext => name.endsWith(ext));
+
+        if (hasAllowedMime || hasAllowedExtension) {
+            cb(null, true);
+        } else {
+            cb(new Error('Invalid file type. Only Images (JPG/PNG/WEBP/GIF), Videos (MP4/WEBM/MOV), and PDFs are allowed.'));
+        }
+    }
+});
 // Increase limits to handle Base64 images
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
@@ -98,7 +133,7 @@ app.use(cors({
             'https://www.bluestonegroupofinstitutions.com',
             'http://bluestonegroupofinstitutions.com'
         ];
-        
+
         if (!origin || allowedOrigins.some(o => origin.startsWith(o))) {
             callback(null, true);
         } else {
@@ -131,6 +166,7 @@ const pool = mysql.createPool({
     queueLimit: 50,
     enableKeepAlive: true,
     keepAliveInitialDelay: 10000,
+    timezone: '+05:30'
 });
 
 // Centralized Query Helper to ensure connection reuse
@@ -139,6 +175,44 @@ async function query(sql, params = []) {
     return rows;
 }
 
+async function ensureMediaGalleryColumns() {
+    try {
+        const [columns] = await pool.query("SHOW COLUMNS FROM media_gallery LIKE 'month'");
+        if (columns.length === 0) {
+            await pool.query("ALTER TABLE media_gallery ADD COLUMN month VARCHAR(50) DEFAULT NULL");
+        }
+    } catch (err) {
+        console.error('Media gallery column check failed:', err.message);
+    }
+}
+
+async function ensureOverseasColumns() {
+    try {
+        const newColumns = [
+            'passport_no', 
+            'university_student_id', 
+            'university_name', 
+            'urm_name', 
+            'urm_phone', 
+            'course_name', 
+            'primary_status', 
+            'secondary_status'
+        ];
+        
+        for (const col of newColumns) {
+            const [columns] = await pool.query(`SHOW COLUMNS FROM leads LIKE '${col}'`);
+            if (columns.length === 0) {
+                await pool.query(`ALTER TABLE leads ADD COLUMN ${col} VARCHAR(255) DEFAULT NULL`);
+                console.log(`Added missing column ${col} to leads table`);
+            }
+        }
+    } catch (err) {
+        console.error('Overseas columns check failed:', err.message);
+    }
+}
+
+ensureMediaGalleryColumns().catch(() => { });
+ensureOverseasColumns().catch(() => { });
 
 // Proactive Error Monitor
 pool.on('error', (err) => {
@@ -180,8 +254,8 @@ const transporter = nodemailer.createTransport({
     port: 465,
     secure: true,
     auth: {
-        user: "bluestoneocs@gmail.com",
-        pass: "pffc oagp umot lssz",
+        user: "bluestonesoftwaredeveloper@gmail.com",
+        pass: "hwmo dxbr oiub mpfr", // Note: Ensure this App Password corresponds to bluestonesoftwaredeveloper@gmail.com
     },
     tls: { rejectUnauthorized: false },
 });
@@ -378,6 +452,11 @@ const triggerEmails = async (candidateName, candidateEmail, candidatePhone, cand
             if (tier === 'SUPER_ADMIN' && u.email) {
                 superAdminEmails.push(u.email);
             } else if (tier === 'ADMIN' && u.email) {
+                // Restrict Agent Admin and Franchise from receiving these emails
+                if (u.role === 'Agent Admin' || u.role === 'Franchise') {
+                    continue;
+                }
+
                 const aliases = getDomainAliases(u.domain);
                 if (aliases.includes(leadDomain)) {
                     adminEmails.push(u.email);
@@ -452,7 +531,13 @@ function canUserAccessLead(lead, user) {
         const aliases = getDomainAliases(user.domain);
         return aliases.includes(lead.domain);
     }
-    if (isStaffUser(user)) return Number(lead.assigned_to) === Number(user.id);
+    if (isStaffUser(user)) {
+        if ((user.role === 'Document Handler' || user.designation === 'Document Handler') &&
+            (lead.domain === 'Bluestone Overseas' || lead.domain === 'Overseas Enrollment' || lead.domain === 'Overseas')) {
+            return true;
+        }
+        return Number(lead.assigned_to) === Number(user.id);
+    }
 
     return false;
 }
@@ -586,18 +671,26 @@ const initDB = async () => {
             // Already dropped
         }
 
-        // 🚀 PERFORMANCE OPTIMIZATION: Ensure activity_date is indexed to prevent ECONNRESET
+        // 🖼️ CANDIDATE PHOTO: Ensure column exists
         try {
-            await connection.query("CREATE INDEX idx_activity_date ON user_activity_log (activity_date)");
-        } catch (e) {
-            // Index existing is fine
-        }
+            await connection.query("ALTER TABLE leads ADD COLUMN candidate_photo VARCHAR(512) NULL");
+        } catch (e) { /* Column already exists */ }
 
-        // 🔄 TERMINOLOGY MIGRATION: 
-        // 1. Final payment -> Full payment
-        await connection.query("UPDATE leads SET payment_status = 'Full payment' WHERE payment_status = 'Final Payment'");
-        // 2. Closed -> Invalid (Fixing empty sub-menu table)
-        await connection.query("UPDATE leads SET status = 'Invalid' WHERE status = 'Closed'");
+        // 🚀 PERFORMANCE INDEXES: Ensure critical query columns are indexed
+        const indexes = [
+            "CREATE INDEX idx_leads_domain ON leads (domain(100))",
+            "CREATE INDEX idx_leads_status ON leads (status)",
+            "CREATE INDEX idx_leads_is_active ON leads (is_active)",
+            "CREATE INDEX idx_leads_assigned_to ON leads (assigned_to)",
+            "CREATE INDEX idx_leads_created_at ON leads (created_at)",
+            "CREATE INDEX idx_leads_updated_at ON leads (updated_at)",
+            "CREATE INDEX idx_leads_phone ON leads (phone)",
+            "CREATE INDEX idx_leads_domain_status ON leads (domain(80), status, is_active)",
+            "CREATE INDEX idx_remarks_lead_id_created ON lead_remarks_messages (lead_id, created_at DESC)"
+        ];
+        for (const idxSql of indexes) {
+            try { await connection.query(idxSql); } catch (e) { /* Index already exists */ }
+        }
 
         console.log("✅ Database Connectivity & Core Schema Verified");
     } catch (err) {
@@ -619,7 +712,7 @@ app.use((err, req, res, next) => {
 // Public Contact Enquiry (website form -> portal leads)
 app.post('/api/contact', async (req, res) => {
     try {
-        const { name, email, phone, message, businessFocus, domain, category, interested_in } = req.body;
+        const { name, email, phone, message, businessFocus, domain, category, interested_in, passport_number } = req.body;
 
         if (!name || !phone || !email) {
             return res.status(400).json({ error: "Missing required fields" });
@@ -631,10 +724,11 @@ app.post('/api/contact', async (req, res) => {
             const leadCode = await getNextLeadCode(normalizedDomain);
             await pool.execute(
                 `INSERT INTO leads
-                 (student_name, email, phone, domain, source, category, interested_in, remarks, lead_code, status, is_active, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1, ?)`,
+                 (student_name, passport_number, email, phone, domain, source, category, interested_in, remarks, lead_code, status, is_active, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1, ?)`,
                 [
                     name,
+                    passport_number || null,
                     email,
                     phone,
                     normalizedDomain,
@@ -664,10 +758,11 @@ app.post('/api/contact', async (req, res) => {
             const leadCode = await getNextLeadCode(domainName);
             await pool.execute(
                 `INSERT INTO leads
-                 (student_name, email, phone, domain, source, category, interested_in, remarks, lead_code, status, is_active, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1, ?)`,
+                 (student_name, passport_number, email, phone, domain, source, category, interested_in, remarks, lead_code, status, is_active, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1, ?)`,
                 [
                     name,
+                    passport_number || null,
                     email,
                     phone,
                     domainName,
@@ -758,6 +853,7 @@ app.post('/api/auth/login', async (req, res) => {
                 employee_id: user.employee_id || null,
                 name: user.name,
                 role: user.role,
+                designation: user.designation,
                 domain: user.domain,
                 tier: user.tier || tier,
                 user_type: user.user_type || 'CORE',
@@ -789,6 +885,57 @@ app.post('/api/auth/login', async (req, res) => {
 
         // 🚀 Mark user as ONLINE immediately
         trackUserActivity(user.id);
+
+        // --- IP, Geolocation, and Notification Logic ---
+        let userIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || req.ip || "Unknown IP";
+        if (userIp && userIp.includes(',')) {
+            userIp = userIp.split(',')[0].trim();
+        }
+
+        let location = req.body.location || "Unknown Location"; // Extracted from Frontend browser geolocation
+
+        // Save to DB
+        try {
+            await pool.execute(
+                'INSERT INTO login_history (user_id, ip_address, location) VALUES (?, ?, ?)',
+                [user.id, userIp, location]
+            );
+        } catch (dbErr) {
+            console.error("DB insert for login history failed:", dbErr);
+        }
+
+        // Send Email Alert
+        try {
+            const mailOptions = {
+                from: '"Bluestone Security" <info@bluestoneocs.com>',
+                to: 'bluestoneocs@gmail.com, admin@bluestoneocs.com, bluestonesoftwaredeveloper@gmail.com',
+                subject: `Security Alert: New CRM Login by ${user.name}`,
+                html: `
+                    <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: 0 auto; border: 1px solid #ddd; border-radius: 8px; overflow: hidden;">
+                        <div style="background-color: #003366; color: #fff; padding: 20px; text-align: center;">
+                            <h2>CRM Login Alert</h2>
+                        </div>
+                        <div style="padding: 20px;">
+                            <p><strong>A user has just logged into the Bluestone CRM portal.</strong></p>
+                            <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
+                                <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>Name</strong></td><td style="padding: 8px; border: 1px solid #ddd;">${user.name}</td></tr>
+                                <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>Email</strong></td><td style="padding: 8px; border: 1px solid #ddd;">${user.email}</td></tr>
+                                <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>Role</strong></td><td style="padding: 8px; border: 1px solid #ddd;">${user.role}</td></tr>
+                                <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>Login Time</strong></td><td style="padding: 8px; border: 1px solid #ddd;">${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} (IST)</td></tr>
+                                <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>IP Address</strong></td><td style="padding: 8px; border: 1px solid #ddd;">${userIp}</td></tr>
+                                <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>Browser Region</strong></td><td style="padding: 8px; border: 1px solid #ddd;">${location}</td></tr>
+                            </table>
+                        </div>
+                        <div style="background-color: #f5f5f5; padding: 15px; text-align: center; font-size: 12px; color: #777;">
+                            <p>This is an automated security message from Bluestone Groups.</p>
+                        </div>
+                    </div>
+                `
+            };
+            transporter.sendMail(mailOptions).catch(err => console.error("Login email send error:", err));
+        } catch (mailErr) {
+            console.error("Login email config error:", mailErr);
+        }
 
     } catch (err) {
         res.status(500).json({ error: "Login failed" });
@@ -1046,12 +1193,18 @@ app.get('/api/dashboard/stats-bulk', authenticateToken, async (req, res) => {
                 SUM(CASE WHEN status = 'Dropped' THEN 1 ELSE 0 END) AS total_dropped,
                 SUM(CASE WHEN status = 'Waiting for Confirmation' THEN 1 ELSE 0 END) AS total_pending,
                 SUM(CASE WHEN status = 'Invalid' THEN 1 ELSE 0 END) AS total_invalid,
+                SUM(CASE WHEN status = 'Enrolled' AND overseas_pipeline_status != 'Document Collection' THEN 1 ELSE 0 END) AS total_processed,
+                SUM(CASE WHEN status = 'Enrolled' AND overseas_pipeline_status = 'CAS / I-20 Processing' THEN 1 ELSE 0 END) AS total_cas_team,
+                SUM(CASE WHEN status = 'Closed' AND overseas_pipeline_status = 'Completed' THEN 1 ELSE 0 END) AS total_completed,
                 SUM(CASE WHEN ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_enquiry,
                 SUM(CASE WHEN status = 'Follow Up' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_followup,
                 SUM(CASE WHEN payment_status IN ('Advance payment','Partial Payment','Full payment','No Fee') AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_enrolled,
                 SUM(CASE WHEN status = 'Dropped' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_dropped,
                 SUM(CASE WHEN status = 'Waiting for Confirmation' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_pending,
-                SUM(CASE WHEN status = 'Invalid' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_invalid
+                SUM(CASE WHEN status = 'Invalid' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_invalid,
+                SUM(CASE WHEN status = 'Enrolled' AND overseas_pipeline_status != 'Document Collection' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_processed,
+                SUM(CASE WHEN status = 'Enrolled' AND overseas_pipeline_status = 'CAS / I-20 Processing' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_cas_team,
+                SUM(CASE WHEN status = 'Closed' AND overseas_pipeline_status = 'Completed' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_completed
             FROM leads
             WHERE ${where}
         `;
@@ -1064,6 +1217,9 @@ app.get('/api/dashboard/stats-bulk', authenticateToken, async (req, res) => {
             ...periodParams, // for period_dropped
             ...periodParams, // for period_pending
             ...periodParams, // for period_invalid
+            ...periodParams, // for period_processed
+            ...periodParams, // for period_cas_team
+            ...periodParams, // for period_completed
             ...baseParams    // for WHERE clause
         ];
 
@@ -1078,6 +1234,9 @@ app.get('/api/dashboard/stats-bulk', authenticateToken, async (req, res) => {
                 dropped: Number(r.total_dropped || 0),
                 pending: Number(r.total_pending || 0),
                 invalid: Number(r.total_invalid || 0),
+                processed: Number(r.total_processed || 0),
+                cas_team: Number(r.total_cas_team || 0),
+                completed: Number(r.total_completed || 0),
             },
             periods: {
                 enquiry: Number(r.period_enquiry || 0),
@@ -1086,14 +1245,17 @@ app.get('/api/dashboard/stats-bulk', authenticateToken, async (req, res) => {
                 dropped: Number(r.period_dropped || 0),
                 pending: Number(r.period_pending || 0),
                 invalid: Number(r.period_invalid || 0),
+                processed: Number(r.period_processed || 0),
+                cas_team: Number(r.period_cas_team || 0),
+                completed: Number(r.period_completed || 0),
             }
         });
     } catch (err) {
         console.error("Bulk Stats Error:", err);
         // Graceful fallback: return zeros so dashboard still loads
         res.status(200).json({
-            totals: { enquiry: 0, followup: 0, enrolled: 0, dropped: 0, pending: 0, invalid: 0 },
-            periods: { enquiry: 0, followup: 0, enrolled: 0, dropped: 0, pending: 0, invalid: 0 },
+            totals: { enquiry: 0, followup: 0, enrolled: 0, dropped: 0, pending: 0, invalid: 0, processed: 0, cas_team: 0, completed: 0 },
+            periods: { enquiry: 0, followup: 0, enrolled: 0, dropped: 0, pending: 0, invalid: 0, processed: 0, cas_team: 0, completed: 0},
             error: 'Stats temporarily unavailable'
         });
     }
@@ -1152,11 +1314,11 @@ app.get('/api/dashboard/financial-stats', authenticateToken, async (req, res) =>
         const finalData = domainRows.map(md => {
             // Normalize names: "Bluestone IAS Academy" -> "IAS Academy"
             const shortName = md.name.replace(/^(Bluestone|BGOI)\s+/i, '').trim();
-            
+
             // Find match in stats (checking both full and short name)
-            const stats = statRows.find(s => 
-                s.domain === shortName || 
-                s.domain === md.name || 
+            const stats = statRows.find(s =>
+                s.domain === shortName ||
+                s.domain === md.name ||
                 md.name.toLowerCase().includes(s.domain.toLowerCase())
             );
 
@@ -1350,6 +1512,41 @@ app.get('/api/dashboard/leads-filter', authenticateToken, async (req, res) => {
     }
 });
 // Fetch Leads (Used by DomainPage.jsx)
+// Helper to attach overseas details from the new table
+async function attachOverseasDetails(leads) {
+    if (!leads || leads.length === 0) return leads;
+    const leadIds = leads.map(l => l.id).filter(id => id);
+    if (leadIds.length === 0) return leads;
+
+    try {
+        const [detailsRows] = await pool.query(
+            `SELECT lead_id, field_key, field_value FROM lead_overseas_details WHERE lead_id IN (${leadIds.join(',')})`
+        );
+
+        const detailsMap = {};
+        for (const row of detailsRows) {
+            if (!detailsMap[row.lead_id]) detailsMap[row.lead_id] = {};
+            detailsMap[row.lead_id][row.field_key] = row.field_value;
+        }
+
+        for (const lead of leads) {
+            if (detailsMap[lead.id]) {
+                let extraFin = {};
+                if (typeof lead.extra_financials === 'string') {
+                    try { extraFin = JSON.parse(lead.extra_financials) || {}; } catch (e) { }
+                } else if (lead.extra_financials) {
+                    extraFin = lead.extra_financials;
+                }
+                extraFin.overseas_details = detailsMap[lead.id];
+                lead.extra_financials = JSON.stringify(extraFin);
+            }
+        }
+    } catch (err) {
+        console.error("Error attaching overseas details:", err);
+    }
+    return leads;
+}
+
 // Fetch Leads (Used by DomainPage.jsx)
 app.get('/api/leads', authenticateToken, async (req, res) => {
     const { domain, assignedTo, view, page = 1, limit = 10, source_type, company_name } = req.query;
@@ -1383,8 +1580,14 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
             filters.push(...aliases);
         };
         if (isStaffUser(req.user)) {
-            where += " AND assigned_to = ?";
-            filters.push(userId);
+            if ((req.user.role === 'Document Handler' || req.user.designation === 'Document Handler') &&
+                (!domain || domain === 'All' || domain === 'Bluestone Overseas' || domain === 'Overseas')) {
+                where += " AND (assigned_to = ? OR domain IN ('Bluestone Overseas', 'Overseas Enrollment', 'Overseas'))";
+                filters.push(userId);
+            } else {
+                where += " AND assigned_to = ?";
+                filters.push(userId);
+            }
         } else if (getUserTier(req.user) === 'ADMIN') {
             addDomainFilter(userDomain);
         } else if (domain && domain !== 'All') {
@@ -1426,7 +1629,8 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
                     id, student_name, email, phone, domain, source, category, 
                     interested_in, remarks, lead_code, status, is_active, 
                     payment_status, total_fees, paid_amount,
-                    assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake, created_at
+                    assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake, created_at,
+                    passport_no, university_student_id, university_name, urm_name, urm_phone, course_name, primary_status, secondary_status, overseas_pipeline_status
                 FROM leads
                 WHERE is_active = 1
                 
@@ -1455,7 +1659,10 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
                     'Mobile' AS source_type,
                     NULL AS company_name,
                     NULL AS intake,
-                    e.created_at
+                    e.created_at,
+                    NULL AS passport_no, NULL AS university_student_id, NULL AS university_name, 
+                    NULL AS urm_name, NULL AS urm_phone, NULL AS course_name, 
+                    NULL AS primary_status, NULL AS secondary_status, NULL AS overseas_pipeline_status
                 FROM bgoi_enquiries e
                 LEFT JOIN users u ON e.user_id = u.id
                 WHERE NOT EXISTS (
@@ -1474,8 +1681,11 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
         const [rows] = await pool.execute(dataSql, [...filters, limitNum, offset]);
         const [countResult] = await pool.execute(countSql, filters);
         const total = countResult[0].total;
+
+        const leadsWithDetails = await attachOverseasDetails(rows);
+
         res.json({
-            leads: rows,
+            leads: leadsWithDetails,
             total,
             page: pageNum,
             limit: limitNum,
@@ -1541,8 +1751,72 @@ app.post('/api/auth/register', authenticateToken, async (req, res) => {
     }
 });
 
+async function sendAgentNotification(agentId, leadDetails, isBulk = false, bulkCount = 0) {
+    if (!agentId) return;
+    try {
+        const [users] = await pool.execute('SELECT name, email, company_name FROM users WHERE id = ?', [agentId]);
+        if (users.length === 0 || !users[0].email) return;
+
+        const agent = users[0];
+        const transporter = createMailTransporter();
+        if (!transporter) return;
+
+        let subject = '';
+        let html = '';
+
+        if (isBulk) {
+            subject = `New Leads Imported - ${agent.company_name || 'Agent Portal'}`;
+            html = `
+                <div style="font-family: Arial, sans-serif; line-height: 1.5; color: #333;">
+                    <h2 style="color: #0f172a;">Bulk Lead Import Successful</h2>
+                    <p>Dear ${agent.name},</p>
+                    <p>You have successfully imported <strong>${bulkCount}</strong> new leads via the agent portal.</p>
+                    <br/>
+                    <p>Best regards,</p>
+                    <p><strong>The Bluestone Groups Team</strong></p>
+                </div>
+            `;
+        } else {
+            subject = `New Lead Submitted - ${leadDetails.leadCode}`;
+            html = `
+                <div style="font-family: Arial, sans-serif; line-height: 1.5; color: #333;">
+                    <h2 style="color: #0f172a;">New Lead Submitted</h2>
+                    <p>Dear ${agent.name},</p>
+                    <p>A new lead has been submitted via the agent portal.</p>
+                    <table style="border-collapse: collapse; width: 100%; max-width: 600px; margin-top: 20px;">
+                        <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>Name:</strong></td><td style="padding: 8px; border: 1px solid #ddd;">${leadDetails.student_name}</td></tr>
+                        <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>Email:</strong></td><td style="padding: 8px; border: 1px solid #ddd;">${leadDetails.email}</td></tr>
+                        <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>Phone:</strong></td><td style="padding: 8px; border: 1px solid #ddd;">${leadDetails.phone}</td></tr>
+                        <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>Domain:</strong></td><td style="padding: 8px; border: 1px solid #ddd;">${leadDetails.domain}</td></tr>
+                        <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>Reference Code:</strong></td><td style="padding: 8px; border: 1px solid #ddd;">${leadDetails.leadCode}</td></tr>
+                    </table>
+                    <br/>
+                    <p>Best regards,</p>
+                    <p><strong>The Bluestone Groups Team</strong></p>
+                </div>
+            `;
+        }
+
+        const recipients = [agent.email, 'bluestoneocs@gmail.com'].join(',');
+
+        transporter.sendMail({
+            from: SMTP_CONFIG.from || SMTP_CONFIG.user,
+            to: recipients,
+            subject: subject,
+            html: html
+        }).catch(err => console.error("Agent notification mail send failed:", err.message));
+
+    } catch (err) {
+        console.error("Agent notification error:", err.message);
+    }
+}
+
 app.post('/api/leads', async (req, res) => {
-    const { student_name, email, phone, domain, category, source, interested_in, remarks, assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake } = req.body;
+    const { 
+        student_name, email, phone, domain, category, source, interested_in, remarks, 
+        assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake, passport_number,
+        passport_no, university_student_id, university_name, urm_name, urm_phone, course_name, primary_status, secondary_status
+    } = req.body;
 
     // Optional Auth for Portal users
     let portalUser = null;
@@ -1591,26 +1865,13 @@ app.post('/api/leads', async (req, res) => {
 
         await pool.execute(
             `INSERT INTO leads 
-            (student_name, email, phone, domain, category, source, interested_in, remarks, lead_code, status, is_active, payment_status, assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake, created_at) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1, 'Pending payment', ?, ?, ?, ?, ?, ?, ?, ?)`,
+            (student_name, passport_number, email, phone, domain, category, source, interested_in, remarks, lead_code, status, is_active, payment_status, assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake, created_at,
+             passport_no, university_student_id, university_name, urm_name, urm_phone, course_name, primary_status, secondary_status) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1, 'Pending payment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
-                student_name,
-                email,
-                phone,
-                normalizedDomain,
-                category,
-                source || 'Dashboard',
-                interested_in,
-                remarks,
-                leadCode,
-                assigned_to || null,
-                assigned_to_name || null,
-                assigned_by || null,
-                assigned_by_name || null,
-                finalSourceType,
-                finalCompanyName,
-                intake || null,
-                nowStr
+                student_name, passport_number || null, email || null, phone || null, normalizedDomain, category || 'Standard Enquiry', source || 'Direct', interested_in || null, remarks || null, leadCode,
+                assigned_to || null, assigned_to_name || null, assigned_by || null, assigned_by_name || null, finalSourceType, finalCompanyName, intake || null, nowStr,
+                passport_no || null, university_student_id || null, university_name || null, urm_name || null, urm_phone || null, course_name || null, primary_status || null, secondary_status || null
             ]
         );
         // ✅ AUTO-RESPONDER EMAIL
@@ -1640,6 +1901,15 @@ app.post('/api/leads', async (req, res) => {
                 console.error("Auto-responder mail configuration error:", mailErr.message);
             }
         }
+
+        // ✅ AGENT NOTIFICATION
+        if (portalUser && (portalUser.user_type === 'AGENT' || String(portalUser.role || '').toLowerCase().includes('agent'))) {
+            sendAgentNotification(portalUser.id, { student_name, email, phone, domain: normalizedDomain, leadCode });
+        }
+
+        // ✅ SUPER ADMIN NOTIFICATION
+        await createSystemNotification(`New Enquiry Received: ${student_name} (${normalizedDomain})`, req.user || { name: 'Website Portal' });
+
         res.status(201).json({ msg: "Lead created", lead_code: leadCode });
     } catch (err) {
         console.error("CREATE LEAD ERROR:", err);
@@ -1652,25 +1922,59 @@ app.put('/api/leads/:id/status', authenticateToken, async (req, res) => {
     const { status } = req.body;
     const changedBy = req.user?.name || 'System';
     try {
-        const [beforeRows] = await pool.execute('SELECT status FROM leads WHERE id = ?', [id]);
+        const [beforeRows] = await pool.execute('SELECT status, lead_code, domain, passport_number FROM leads WHERE id = ?', [id]);
         if (beforeRows.length === 0) return res.status(404).json({ msg: "Lead not found" });
+        
         const oldStatus = beforeRows[0].status;
+        const leadCode = beforeRows[0].lead_code || `#${id}`;
+        const domain = beforeRows[0].domain || '';
+        const passport_number = beforeRows[0].passport_number || '';
+
+        // Validation for Overseas Enrolled
+        if (status === 'Enrolled' && domain.toLowerCase().includes('overseas')) {
+            if (!passport_number || !passport_number.trim()) {
+                return res.status(400).json({ msg: "Passport number is mandatory for enrolled overseas candidates" });
+            }
+        }
+
         const nowStr = getISTString();
-        await pool.execute('UPDATE leads SET status = ? WHERE id = ?', [status, id]);
+        await pool.execute('UPDATE leads SET status = ?, updated_at = ? WHERE id = ?', [status, nowStr, id]);
         await pool.execute(
             `INSERT INTO lead_edit_history (lead_id, action_type, field_name, old_value, new_value, changed_by, changed_at)
              VALUES (?, 'STATUS_UPDATE', 'status', ?, ?, ?, ?)`,
             [id, oldStatus || '', status || '', changedBy, nowStr]
         );
+        // ✅ SUPER ADMIN NOTIFICATION
+        await createSystemNotification(`Status updated to '${status}' for Candidate ${leadCode}`, req.user);
+
         res.json({ msg: "Updated" });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
+
+// Get Payment History
+app.get('/api/leads/:id/payment-history', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const [rows] = await pool.execute(
+            `SELECT action_type, field_name, old_value, new_value, changed_by, changed_at 
+             FROM lead_edit_history 
+             WHERE lead_id = ? AND action_type = 'PAYMENT_UPDATE' 
+             ORDER BY changed_at DESC`,
+            [id]
+        );
+        res.json({ success: true, data: rows });
+    } catch (err) {
+        console.error("PAYMENT HISTORY ERROR:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Update Payment Details (Super Admin, Admin, and Staff)
 app.put('/api/leads/:id/payment', authenticateToken, async (req, res) => {
     const { id } = req.params;
-    const { payment_status, total_fees, paid_amount, extra_financials } = req.body;
+    const { payment_status, total_fees, paid_amount, extra_financials, payment_date } = req.body;
 
     // Permissions: Allow Super Admin, Admin, Staff
     if (!isAdminUser(req.user) && !isStaffUser(req.user)) {
@@ -1705,8 +2009,37 @@ app.put('/api/leads/:id/payment', authenticateToken, async (req, res) => {
             const num = Number(value);
             return Number.isFinite(num) ? num : NaN;
         };
-        const nextTotalFees = parseAmount(total_fees, before.total_fees);
-        const nextPaidAmount = parseAmount(paid_amount, before.paid_amount);
+        let nextTotalFees = parseAmount(total_fees, before.total_fees);
+        let nextPaidAmount = parseAmount(paid_amount, before.paid_amount);
+
+        let finalExtraFinancialsObj = extra_financials;
+        if (typeof extra_financials === 'string') {
+            try { finalExtraFinancialsObj = JSON.parse(extra_financials); } catch (e) { }
+        }
+
+        if (finalExtraFinancialsObj === undefined || finalExtraFinancialsObj === null) {
+            finalExtraFinancialsObj = {};
+        } else if (typeof finalExtraFinancialsObj !== 'object') {
+            finalExtraFinancialsObj = { value: finalExtraFinancialsObj };
+        }
+
+        if (payment_date !== undefined) {
+            finalExtraFinancialsObj.payment_date = payment_date;
+        }
+
+        // Auto-calculate for Overseas Domain
+        const shortDomainName = (before.domain || '').replace(/^(Bluestone|BGOI)\\s+/i, '').trim().toLowerCase();
+        if (shortDomainName === 'overseas' && finalExtraFinancialsObj && finalExtraFinancialsObj.overseas_milestones) {
+            let mTotal = 0;
+            let mPaid = 0;
+            Object.values(finalExtraFinancialsObj.overseas_milestones).forEach(m => {
+                mTotal += Number(m.amount) || 0;
+                mPaid += Number(m.paid) || 0;
+            });
+            nextTotalFees = mTotal;
+            nextPaidAmount = mPaid;
+        }
+
         if (Number.isNaN(nextTotalFees) || Number.isNaN(nextPaidAmount)) {
             return res.status(400).json({ msg: 'Fees and paid amount must be numbers' });
         }
@@ -1720,13 +2053,35 @@ app.put('/api/leads/:id/payment', authenticateToken, async (req, res) => {
             ? 'Enrolled'
             : before.status;
 
-        const nextExtraFinancials = extra_financials !== undefined
-            ? (typeof extra_financials === 'object' ? JSON.stringify(extra_financials) : extra_financials)
+        // Handle Migration to lead_overseas_details
+        if (finalExtraFinancialsObj && finalExtraFinancialsObj.overseas_details) {
+            const details = finalExtraFinancialsObj.overseas_details;
+
+            // Delete old details for this lead
+            await pool.execute('DELETE FROM lead_overseas_details WHERE lead_id = ?', [id]);
+
+            // Insert new details
+            for (const [key, value] of Object.entries(details)) {
+                if (value !== undefined && value !== null && value !== '') {
+                    await pool.execute(
+                        'INSERT INTO lead_overseas_details (lead_id, field_key, field_value) VALUES (?, ?, ?)',
+                        [id, key, String(value)]
+                    );
+                }
+            }
+
+            // Remove from JSON payload
+            delete finalExtraFinancialsObj.overseas_details;
+        }
+
+        const nextExtraFinancials = finalExtraFinancialsObj !== undefined
+            ? (typeof finalExtraFinancialsObj === 'object' ? JSON.stringify(finalExtraFinancialsObj) : finalExtraFinancialsObj)
             : before.extra_financials;
 
+        const nowStr = getISTString();
         await pool.execute(
-            'UPDATE leads SET payment_status = ?, total_fees = ?, paid_amount = ?, status = ?, extra_financials = ? WHERE id = ?',
-            [nextPaymentStatus, nextTotalFees, nextPaidAmount, nextStatus, nextExtraFinancials, id]
+            'UPDATE leads SET payment_status = ?, total_fees = ?, paid_amount = ?, status = ?, extra_financials = ?, updated_at = ? WHERE id = ?',
+            [nextPaymentStatus, nextTotalFees, nextPaidAmount, nextStatus, nextExtraFinancials, nowStr, id]
         );
         const changedBy = req.user?.name || 'System';
         const historyRows = [];
@@ -1743,7 +2098,19 @@ app.put('/api/leads/:id/payment', authenticateToken, async (req, res) => {
         if (Number(before.paid_amount || 0) !== Number(nextPaidAmount || 0)) {
             historyRows.push([id, 'PAYMENT_UPDATE', 'paid_amount', String(before.paid_amount || 0), String(nextPaidAmount || 0), changedBy]);
         }
-        const nowStr = getISTString();
+
+        let oldPaymentDate = '';
+        try {
+            if (before.extra_financials) {
+                const parsed = typeof before.extra_financials === 'string' ? JSON.parse(before.extra_financials) : before.extra_financials;
+                oldPaymentDate = parsed.payment_date || '';
+            }
+        } catch (e) { }
+
+        if (payment_date !== undefined && (oldPaymentDate || '') !== (payment_date || '')) {
+            historyRows.push([id, 'PAYMENT_UPDATE', 'payment_date', oldPaymentDate || '', payment_date || '', changedBy]);
+        }
+
         for (const h of historyRows) {
             await pool.execute(
                 `INSERT INTO lead_edit_history (lead_id, action_type, field_name, old_value, new_value, changed_by, changed_at)
@@ -1751,6 +2118,12 @@ app.put('/api/leads/:id/payment', authenticateToken, async (req, res) => {
                 [...h, nowStr]
             );
         }
+
+        // ✅ SUPER ADMIN NOTIFICATION
+        const [lcRowsFin] = await pool.execute('SELECT lead_code FROM leads WHERE id = ?', [id]);
+        const leadCodeFin = lcRowsFin[0]?.lead_code || `#${id}`;
+        await createSystemNotification(`Financial details updated for Candidate ${leadCodeFin}`, req.user);
+
         return res.json({
             msg: 'Payment details updated',
             payment: {
@@ -1796,6 +2169,7 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
     const offset = (pageNum - 1) * limitNum;
     const sortMap = {
         created_at: 'created_at',
+        updated_at: 'updated_at',
         student_name: 'student_name',
         domain: 'domain',
         status: 'status',
@@ -1803,7 +2177,7 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
         total_fees: 'total_fees',
         paid_amount: 'paid_amount',
     };
-    const safeSortBy = sortMap[sort_by] || 'created_at';
+    const safeSortBy = sortMap[sort_by] || 'updated_at';
     const safeSortOrder = String(sort_order).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
 
     try {
@@ -1813,7 +2187,7 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
                     id, student_name, email, phone, domain, source, category, 
                     interested_in, remarks, lead_code, status, is_active, payment_status, 
                     total_fees, paid_amount, invalid_reason,
-                    assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake, created_at
+                    assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake, created_at, updated_at
                 FROM leads
                 WHERE is_active = 1
                 
@@ -1843,7 +2217,8 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
                     'Mobile' AS source_type,
                     NULL AS company_name,
                     NULL AS intake,
-                    e.created_at
+                    e.created_at,
+                    NULL AS updated_at
                 FROM bgoi_enquiries e
                 WHERE NOT EXISTS (
                     SELECT 1 FROM leads l 
@@ -1971,11 +2346,19 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
         const [countRows] = await pool.execute(countSql, params);
         const total = countRows[0]?.total || 0;
 
+        // ✅ PERFORMANCE: Use LEFT JOIN instead of correlated subquery in BGI leads endpoint
         const listSql = `
-            SELECT *, (SELECT subject FROM lead_remarks_messages WHERE lead_id = combined.id ORDER BY created_at DESC, id DESC LIMIT 1) as latest_remark_subject
+            SELECT combined.*,
+                lrm_sub.latest_remark_subject
             FROM ${combinedBase}
+            LEFT JOIN (
+                SELECT lead_id,
+                    SUBSTRING_INDEX(GROUP_CONCAT(subject ORDER BY created_at DESC, id DESC SEPARATOR '|||'), '|||', 1) AS latest_remark_subject
+                FROM lead_remarks_messages
+                GROUP BY lead_id
+            ) lrm_sub ON lrm_sub.lead_id = combined.id
             ${where}
-            ORDER BY ${safeSortBy} ${safeSortOrder}
+            ORDER BY ${safeSortBy === 'updated_at' ? 'COALESCE(combined.updated_at, combined.created_at)' : `combined.${safeSortBy}`} ${safeSortOrder}
             LIMIT ? OFFSET ?
         `;
         const [rows] = await pool.execute(listSql, [...params, limitNum, offset]);
@@ -1999,12 +2382,13 @@ app.put('/api/leads/remarks', authenticateToken, async (req, res) => {
     const { leadId, remarks } = req.body;
     const userName = req.user?.name || 'Staff'; // Use fallback to prevent SQL crash
     try {
-        const [beforeRows] = await pool.execute('SELECT remarks FROM leads WHERE id = ?', [leadId]);
+        const [beforeRows] = await pool.execute('SELECT remarks, lead_code FROM leads WHERE id = ?', [leadId]);
         const oldRemarks = beforeRows[0]?.remarks || '';
-        // 1. Update the lead first (The most important part)
-        await pool.execute('UPDATE leads SET remarks = ? WHERE id = ?', [remarks || '', leadId]);
-        // 2. Try to log history (Wrapped in its own try/catch so it doesn't break the main save)
+        const leadCodeRmk = beforeRows[0]?.lead_code || `#${leadId}`;
         const nowStr = getISTString();
+        // 1. Update the lead first (The most important part)
+        await pool.execute('UPDATE leads SET remarks = ?, updated_at = ? WHERE id = ?', [remarks || '', nowStr, leadId]);
+        // 2. Try to log history (Wrapped in its own try/catch so it doesn't break the main save)
         try {
             await pool.execute(
                 'INSERT INTO remarks_history (lead_id, old_remarks, new_remarks, changed_by, changed_at) VALUES (?, ?, ?, ?, ?)',
@@ -2018,6 +2402,10 @@ app.put('/api/leads/remarks', authenticateToken, async (req, res) => {
         } catch (historyErr) {
             console.error("History log failed, but remarks were saved:", historyErr.message);
         }
+
+        // ✅ SUPER ADMIN NOTIFICATION
+        await createSystemNotification(`Initial Remarks updated for Candidate ${leadCodeRmk}`, req.user);
+
         // 3. Send a clean JSON response
         return res.status(200).json({
             success: true,
@@ -2329,10 +2717,14 @@ app.post('/api/leads/bulk', authenticateToken, async (req, res) => {
 
         for (const l of leads) {
             const normDom = normalizeContactDomain(String(l.domain || '').trim());
-            const phone = String(l.phone || '').trim();
+            const rawPhone = String(l.phone || '').trim();
+            // Normalize phone: keep leading +, strip all non-digits
+            const hasPlus = rawPhone.startsWith('+');
+            const digits = rawPhone.replace(/[^\d]/g, '');
+            const phone = hasPlus ? '+' + digits : digits;
 
-            if (!phone || !normDom) {
-                skipped.push({ name: l.student_name, phone, domain: normDom, reason: "Missing phone or domain" });
+            if (!phone || digits.length < 7 || !normDom) {
+                skipped.push({ name: l.student_name, phone: rawPhone, domain: normDom, reason: !normDom ? "Missing domain" : "Invalid/missing phone" });
                 continue;
             }
 
@@ -2353,7 +2745,7 @@ app.post('/api/leads/bulk', authenticateToken, async (req, res) => {
                 continue;
             }
 
-            uniqueLeads.push({ ...l, domain: normDom });
+            uniqueLeads.push({ ...l, phone, domain: normDom });
         }
 
         if (uniqueLeads.length === 0) {
@@ -2370,8 +2762,21 @@ app.post('/api/leads/bulk', authenticateToken, async (req, res) => {
 
         // Use a loop or batch query for codes to avoid huge concurrency
         const values = [];
+        const domainCounters = {}; // Cache to prevent duplicate lead codes during bulk insert
+        
         for (const l of uniqueLeads) {
-            const leadCode = await getNextLeadCode(l.domain);
+            const prefix = getLeadCodePrefix(l.domain);
+            let leadCode;
+            
+            if (domainCounters[prefix] !== undefined) {
+                domainCounters[prefix]++;
+                leadCode = `${prefix}-${String(domainCounters[prefix]).padStart(4, '0')}`;
+            } else {
+                leadCode = await getNextLeadCode(l.domain, connection);
+                const lastNum = parseInt(String(leadCode).split('-')[1], 10);
+                domainCounters[prefix] = lastNum;
+            }
+            
             values.push([
                 l.student_name,
                 l.email,
@@ -2402,6 +2807,11 @@ app.post('/api/leads/bulk', authenticateToken, async (req, res) => {
         await connection.query(sql, [values]);
         await connection.commit();
 
+        // ✅ AGENT NOTIFICATION
+        if (req.user && (req.user.user_type === 'AGENT' || String(req.user.role || '').toLowerCase().includes('agent'))) {
+            sendAgentNotification(req.user.id, null, true, values.length);
+        }
+
         res.json({
             message: `Imported ${values.length} leads successfully.`,
             count: values.length,
@@ -2428,7 +2838,7 @@ app.get('/api/leads/domain/:domainName', authenticateToken, async (req, res) => 
         status = 'All',
         search = '',
         assigned_to = 'All',
-        sortBy = 'created_at',
+        sortBy = 'updated_at',
         sortOrder = 'desc',
         today,
         date,
@@ -2463,8 +2873,14 @@ app.get('/api/leads/domain/:domainName', authenticateToken, async (req, res) => 
         }
         // ROLE
         if (isStaffUser(req.user)) {
-            where += ' AND assigned_to = ?';
-            params.push(userId);
+            if ((req.user.role === 'Document Handler' || req.user.designation === 'Document Handler') &&
+                (domainName === 'All' || domainName === 'Bluestone Overseas' || domainName === 'Overseas')) {
+                where += " AND (assigned_to = ? OR domain IN ('Bluestone Overseas', 'Overseas Enrollment', 'Overseas'))";
+                params.push(userId);
+            } else {
+                where += ' AND assigned_to = ?';
+                params.push(userId);
+            }
         } else if (assigned_to && assigned_to !== 'All') {
             where += ' AND assigned_to = ?';
             params.push(Number(assigned_to));
@@ -2535,23 +2951,42 @@ app.get('/api/leads/domain/:domainName', authenticateToken, async (req, res) => 
         }
 
         const validSortBy = [
-            'created_at', 'student_name', 'phone', 'email', 'status', 'category', 'interested_in', 'lead_code'
-        ].includes(sortBy) ? sortBy : 'created_at';
+            'created_at', 'updated_at', 'student_name', 'phone', 'email', 'status', 'category', 'interested_in', 'lead_code', 'intake'
+        ].includes(sortBy) ? sortBy : 'updated_at';
         const validSortOrder = ['asc', 'desc'].includes(sortOrder.toLowerCase()) ? sortOrder.toUpperCase() : 'DESC';
         const [countRows] = await pool.execute(
             `SELECT COUNT(*) as total FROM leads ${where}`,
             params
         );
+
+        // ✅ PERFORMANCE: Use LEFT JOIN instead of correlated subqueries (N+1 → single JOIN)
+        let orderByClause;
+        if (validSortBy === 'updated_at') {
+            orderByClause = `COALESCE(lrm_latest.latest_remark_at, l.created_at) ${validSortOrder}`;
+        } else {
+            orderByClause = `l.${validSortBy} ${validSortOrder}`;
+        }
+
         const [rows] = await pool.execute(
-            `SELECT *, (SELECT subject FROM lead_remarks_messages WHERE lead_id = leads.id ORDER BY created_at DESC, id DESC LIMIT 1) as latest_remark_subject
-             FROM leads
-             ${where}
-             ORDER BY ${validSortBy} ${validSortOrder}
+            `SELECT l.*,
+                lrm_latest.latest_remark_subject,
+                lrm_latest.latest_remark_at AS updated_at
+             FROM leads l
+             LEFT JOIN (
+                SELECT lead_id,
+                    MAX(created_at) AS latest_remark_at,
+                    SUBSTRING_INDEX(GROUP_CONCAT(subject ORDER BY created_at DESC, id DESC SEPARATOR '|||'), '|||', 1) AS latest_remark_subject
+                FROM lead_remarks_messages
+                GROUP BY lead_id
+             ) lrm_latest ON lrm_latest.lead_id = l.id
+             ${where.replace(/FROM leads/g, 'FROM leads l')}
+             ORDER BY ${orderByClause}
              LIMIT ? OFFSET ?`,
             [...params, limitNum, offset]
         );
+        const leadsWithDetails = await attachOverseasDetails(rows);
         res.json({
-            leads: rows,
+            leads: leadsWithDetails,
             pagination: {
                 total: countRows[0].total,
                 currentPage: pageNum,
@@ -2578,7 +3013,10 @@ app.get('/api/leads/:id', authenticateToken, async (req, res) => {
         if (!canUserAccessLead(lead, req.user)) {
             return res.status(403).json({ message: "Access denied" });
         }
-        res.json(lead);
+
+        const leadsWithDetails = await attachOverseasDetails([lead]);
+
+        res.json(leadsWithDetails[0]);
     } catch (err) {
         console.error("Lead details fetch error:", err);
         res.status(500).json({ error: "Failed to fetch lead details" });
@@ -2844,7 +3282,9 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
         includeCandidateBCC = false,
         attachment_base64,
         attachment_name,
-        attachment_type
+        attachment_type,
+        customToEmails = [],
+        customCcEmails = []
     } = req.body;
     // Safe parse recipient ids
     try {
@@ -2986,34 +3426,34 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
         const candidateEmail = lead.email;
 
         // Strictly only what is selected or specifically requested (no automatic background CCs)
+        const parsedCustomCc = Array.isArray(customCcEmails) ? customCcEmails : [];
         const allCCEmails = [...new Set([
             ...staffEmails,
             ...systemEmails,
-            ...agentEmails
-        ])];
+            ...agentEmails,
+            ...parsedCustomCc
+        ])].filter(Boolean);
 
-        let finalTo = primaryEmail;
+        let parsedCustomTo = Array.isArray(customToEmails) ? customToEmails : [];
+        if (typeof customToEmails === 'string') {
+            try { parsedCustomTo = JSON.parse(customToEmails); } catch { parsedCustomTo = customToEmails ? customToEmails.split(',') : []; }
+        }
+
+        let defaultTo = ["bluestoneocs@gmail.com", "info@bluestoneocs.com", "bluestonecoimbatore@gmail.com"];
+        if (isAgentComp && companyDefaultEmails.length > 0) {
+            defaultTo = companyDefaultEmails.filter(e => e.toLowerCase() !== (candidateEmail || '').toLowerCase());
+        }
+
+        let finalToArr = [...new Set([...defaultTo, ...parsedCustomTo.map(e => e.trim())])].filter(Boolean);
 
         // Safety: Candidate email should NEVER be the primary 'To' recipient for internal remarks
-        if (finalTo && candidateEmail && finalTo.toLowerCase() === candidateEmail.toLowerCase()) {
-            finalTo = null;
-        }
+        finalToArr = finalToArr.filter(e => e.toLowerCase() !== (candidateEmail || '').toLowerCase());
 
-        if (!finalTo) {
-            if (isAgentComp && companyDefaultEmails.length > 0) {
-                // Find first office email that isn't the candidate
-                finalTo = companyDefaultEmails.find(e => e.toLowerCase() !== (candidateEmail || '').toLowerCase()) || companyDefaultEmails[0];
-                if (finalTo && candidateEmail && finalTo.toLowerCase() === candidateEmail.toLowerCase()) {
-                    finalTo = "bluestoneocs@gmail.com";
-                }
-            } else {
-                finalTo = "bluestoneocs@gmail.com";
-            }
-        }
+        let finalTo = finalToArr.join(', ') || "info@bluestoneocs.com";
         const finalCC = allCCEmails.length > 0 ? allCCEmails.join(",") : null;
 
         // BCC Logic: Always include system default in background, candidate only if enabled
-        const bccList = ["bluestoneocs@gmail.com"];
+        const bccList = ["info@bluestoneocs.com", "bluestonecoimbatore@gmail.com", "bluestoneocs@gmail.com"];
         if (includeCandidateBCC && candidateEmail) {
             bccList.push(candidateEmail);
         }
@@ -3112,11 +3552,17 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
         );
         console.log(`Saved remark message ${insertResult.insertId} for lead ${id}. Status: ${sentStatus}`);
 
+        // Update lead modified time
+        await pool.execute('UPDATE leads SET updated_at = ? WHERE id = ?', [nowStr, id]);
+
         if (sentStatus !== "SENT") {
             return res.status(400).json({
                 msg: `Saved, but mail not sent: ${sentError}`
             });
         }
+
+        // ✅ SUPER ADMIN NOTIFICATION
+        await createSystemNotification(`Mail sent to Candidate ${resolvedRefId} (Subject: ${subject})|||${description}`, req.user);
 
         return res.status(201).json({
             msg: "Remark saved and mail sent"
@@ -3141,7 +3587,10 @@ app.put('/api/leads/:id/remark-messages/:messageId',
             includeCandidateBCC = false,
             attachment_base64,
             attachment_name,
-            attachment_type
+            attachment_type,
+            customToEmail = null,
+            customCcEmails = [],
+            primaryRecipientId = null
         } = req.body;
         if (!subject || !description) {
             return res.status(400).json({ msg: 'subject and description are required' });
@@ -3222,13 +3671,14 @@ app.put('/api/leads/:id/remark-messages/:messageId',
             const superAdminEmails = superAdmins.map(u => u.email).filter(Boolean);
             console.log(`Found ${superAdminEmails.length} super admins for CC (Edit):`, superAdminEmails);
 
-            const allCCEmails = [...new Set([...staffEmails, ...superAdminEmails])];
+            const parsedCustomCc = Array.isArray(customCcEmails) ? customCcEmails : [];
+            const allCCEmails = [...new Set([...staffEmails, ...superAdminEmails, ...parsedCustomCc])].filter(Boolean);
 
-            const finalTo = "bluestoneocs@gmail.com";
+            const finalTo = (primaryRecipientId === 'custom' && customToEmail) ? customToEmail : "info@bluestoneocs.com";
             const finalCC = allCCEmails.length > 0 ? allCCEmails.join(",") : null;
 
             // Sync BCC Logic with POST: Always include system default in background
-            const bccList = ["bluestoneocs@gmail.com"];
+            const bccList = ["info@bluestoneocs.com", "bluestonecoimbatore@gmail.com", "bluestoneocs@gmail.com"];
             if (includeCandidateBCC && candidateEmail) {
                 bccList.push(candidateEmail);
             }
@@ -3349,6 +3799,31 @@ app.get('/api/leads/remark-history/:messageId', authenticateToken, async (req, r
         res.status(500).json({ error: "Failed to fetch history" });
     }
 });
+
+// --- HELPER: SYSTEM NOTIFICATIONS ---
+async function createSystemNotification(message, reqUser) {
+    try {
+        const actorName = reqUser?.name || reqUser?.email || "System";
+        const nowStr = getISTString();
+        const dateStr = nowStr.split(' ')[0]; // YYYY-MM-DD
+
+        // target_domains = 'SUPER_ADMIN_ONLY' ensures regular staff can't see it,
+        // but Super Admins bypass the filter entirely in GET /api/notifications.
+        const [result] = await pool.execute(
+            'INSERT INTO notifications (date, message, flag, is_active, target_domains, target_user_ids, created_by, updated_by, created_at, updated_at) VALUES (?, ?, 1, 1, ?, NULL, ?, ?, ?, ?)',
+            [dateStr, message, 'SUPER_ADMIN_ONLY', actorName, actorName, nowStr, nowStr]
+        );
+        const newId = result.insertId;
+
+        await pool.execute(
+            'INSERT INTO notifications_history (notification_id, action_type, new_message, new_date, new_is_active, new_target_domains, new_target_user_ids, changed_by, changed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [newId, 'CREATED', message, dateStr, 1, 'SUPER_ADMIN_ONLY', null, actorName, nowStr]
+        );
+    } catch (e) {
+        console.error("Failed to create automated system notification:", e.message);
+    }
+}
+
 // --- NOTIFICATION / LIVE FEED ROUTES ---
 app.get('/api/notifications/all', authenticateToken, async (req, res) => {
     try {
@@ -3725,13 +4200,36 @@ app.post('/api/auth/verify-password', authenticateToken, async (req, res) => {
         res.status(500).json({ error: "Verification failed" });
     }
 });
+// Get User Location Tracking (Super Admin Only)
+app.get('/api/location-tracking', authenticateToken, async (req, res) => {
+    if (!isSuperAdminUser(req.user)) {
+        return res.status(403).json({ msg: "Unauthorized access" });
+    }
+    try {
+        const [rows] = await pool.execute(`
+            SELECT lh.id as log_id, u.id, u.employee_id, u.name, u.email, u.role, u.tier, u.user_type, 
+                   lh.ip_address as last_login_ip, lh.location as last_login_location, 
+                   lh.login_time as last_active_at,
+                   TIMESTAMPDIFF(SECOND, u.last_active_at, CURRENT_TIMESTAMP) AS seconds_since_active 
+            FROM login_history lh
+            JOIN users u ON lh.user_id = u.id
+            ORDER BY lh.login_time DESC
+            LIMIT 500
+        `);
+        res.json(rows);
+    } catch (err) {
+        console.error("Error fetching location tracking:", err);
+        res.status(500).json({ error: "Failed to fetch tracking data" });
+    }
+});
+
 // --- NEW: STAFF MANAGEMENT ROUTES ---
 // 1. Fetch ALL Staff (For the Admin Directory)
 // Example fix in server.js
 app.get('/api/staff-directory', authenticateToken, async (req, res) => {
     try {
         const [rows] = await pool.execute(
-            'SELECT id, employee_id, name, role, tier, user_type, company_name, designation, domain, phone, email, avatar, is_active, can_export_copy, can_edit, show_country_menu, last_active_at, TIMESTAMPDIFF(SECOND, last_active_at, CURRENT_TIMESTAMP) AS seconds_since_active FROM users WHERE deleted_at IS NULL ORDER BY id DESC'
+            'SELECT id, employee_id, name, role, tier, user_type, company_name, designation, domain, phone, email, avatar, is_active, can_export_copy, can_edit, show_country_menu, last_active_at, last_login_location, TIMESTAMPDIFF(SECOND, last_active_at, CURRENT_TIMESTAMP) AS seconds_since_active FROM users WHERE deleted_at IS NULL ORDER BY id DESC'
         );
 
         // Core Super Admin: Sees everything
@@ -4209,7 +4707,7 @@ app.get('/api/staff/:id/personal-details', authenticateToken, async (req, res) =
             `SELECT *, 
              DATE_FORMAT(dob, '%Y-%m-%d') as dob, 
              DATE_FORMAT(doj, '%Y-%m-%d') as doj 
-             FROM staff_personal_details WHERE user_id = ?`, 
+             FROM staff_personal_details WHERE user_id = ?`,
             [id]
         );
         if (rows.length === 0) {
@@ -4234,8 +4732,8 @@ app.post('/api/staff/:id/personal-details', authenticateToken, (req, res) => {
         }
 
         const { id } = req.params;
-        const { aadhar_name, personal_email, phone, dob, doj, address, has_experience } = req.body;
-        
+        const { aadhar_name, personal_email, phone, dob, doj, address, has_experience, blood_group, emergency_contact, department } = req.body;
+
         // Security: Only Admins can edit
         if (!isAdminUser(req.user)) {
             return res.status(403).json({ msg: "Access Denied" });
@@ -4246,7 +4744,7 @@ app.post('/api/staff/:id/personal-details', authenticateToken, (req, res) => {
             if (userRows.length === 0) return res.status(404).json({ msg: "User not found" });
 
             const [existing] = await pool.execute('SELECT * FROM staff_personal_details WHERE user_id = ?', [id]);
-            
+
             // Helper to find file path by fieldname
             const getFilePath = (fieldName) => {
                 const file = req.files && req.files.find(f => f.fieldname === fieldName);
@@ -4258,7 +4756,11 @@ app.post('/api/staff/:id/personal-details', authenticateToken, (req, res) => {
             let pan_path = getFilePath('pan') || existing[0]?.pan_path || null;
             let degree_path = getFilePath('degree') || existing[0]?.degree_path || null;
             let experience_path = getFilePath('experience_cert') || existing[0]?.experience_path || null;
-            
+            let self_attestation_path = getFilePath('self_attestation') || existing[0]?.self_attestation_path || null;
+            let bank_details_path = getFilePath('bank_details') || existing[0]?.bank_details_path || null;
+            let offer_letter_path = getFilePath('offer_letter') || existing[0]?.offer_letter_path || null;
+            let payslip_path = getFilePath('payslip') || existing[0]?.payslip_path || null;
+
             // Handle dynamic other docs
             let otherDocsArray = [];
             if (existing.length > 0 && existing[0].other_doc_path) {
@@ -4306,22 +4808,34 @@ app.post('/api/staff/:id/personal-details', authenticateToken, (req, res) => {
                 await pool.execute(
                     `INSERT INTO staff_personal_details (
                         user_id, aadhar_name, personal_email, phone, dob, doj, address, has_experience,
-                        resume_path, aadhar_path, pan_path, degree_path, experience_path, other_doc_path
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                        blood_group, emergency_contact, department,
+                        resume_path, aadhar_path, pan_path, degree_path, experience_path,
+                        self_attestation_path, bank_details_path, offer_letter_path, payslip_path,
+                        other_doc_path
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                     [
                         id, aadhar_name, personal_email, phone, dob, doj, address, expVal,
-                        resume_path, aadhar_path, pan_path, degree_path, experience_path, other_doc_path
+                        blood_group || null, emergency_contact || null, department || null,
+                        resume_path, aadhar_path, pan_path, degree_path, experience_path,
+                        self_attestation_path, bank_details_path, offer_letter_path, payslip_path,
+                        other_doc_path
                     ]
                 );
             } else {
                 await pool.execute(
                     `UPDATE staff_personal_details SET
                         aadhar_name = ?, personal_email = ?, phone = ?, dob = ?, doj = ?, address = ?, has_experience = ?,
-                        resume_path = ?, aadhar_path = ?, pan_path = ?, degree_path = ?, experience_path = ?, other_doc_path = ?
+                        blood_group = ?, emergency_contact = ?, department = ?,
+                        resume_path = ?, aadhar_path = ?, pan_path = ?, degree_path = ?, experience_path = ?,
+                        self_attestation_path = ?, bank_details_path = ?, offer_letter_path = ?, payslip_path = ?,
+                        other_doc_path = ?
                     WHERE user_id = ?`,
                     [
                         aadhar_name, personal_email, phone, dob, doj, address, expVal,
-                        resume_path, aadhar_path, pan_path, degree_path, experience_path, other_doc_path, id
+                        blood_group || null, emergency_contact || null, department || null,
+                        resume_path, aadhar_path, pan_path, degree_path, experience_path,
+                        self_attestation_path, bank_details_path, offer_letter_path, payslip_path,
+                        other_doc_path, id
                     ]
                 );
             }
@@ -4332,6 +4846,415 @@ app.post('/api/staff/:id/personal-details', authenticateToken, (req, res) => {
             res.status(500).json({ error: "Failed to save personal details" });
         }
     });
+});
+
+// ==========================================
+// STANDALONE STAFF RECORDS (HR Management)
+// ==========================================
+
+// GET all staff records
+app.get('/api/staff-records', authenticateToken, async (req, res) => {
+    if (getUserTier(req.user) !== 'SUPER_ADMIN') return res.status(403).json({ msg: 'Access Denied' });
+    try {
+        const [rows] = await pool.execute(
+            `SELECT id, employee_id, name, personal_email, phone,
+             DATE_FORMAT(dob, '%Y-%m-%d') as dob,
+             DATE_FORMAT(doj, '%Y-%m-%d') as doj,
+             blood_group, department, designation, emergency_contact, address, has_experience,
+             aadhar_path, pan_path, self_attestation_path, degree_path, bank_details_path,
+             resume_path, offer_letter_path, experience_cert_path, payslip_path, other_doc_path,
+             created_at, updated_at
+             FROM staff_records ORDER BY name ASC`
+        );
+        res.json(rows);
+    } catch (err) {
+        console.error('Fetch staff records error:', err);
+        res.status(500).json({ error: 'Failed to fetch staff records' });
+    }
+});
+
+// POST create new staff record
+app.post('/api/staff-records', authenticateToken, (req, res) => {
+    const cpUpload = uploadStaffDocs.any();
+    cpUpload(req, res, async (err) => {
+        if (err) return res.status(400).json({ msg: `Upload error: ${err.message}` });
+        if (getUserTier(req.user) !== 'SUPER_ADMIN') return res.status(403).json({ msg: 'Access Denied' });
+
+        const {
+            employee_id, name, personal_email, phone, dob, doj,
+            blood_group, department, designation, emergency_contact, address, has_experience
+        } = req.body;
+
+        if (!name || !name.trim()) return res.status(400).json({ msg: 'Full name is required' });
+        if (!phone || !phone.trim()) return res.status(400).json({ msg: 'Phone number is required' });
+
+        try {
+            const getFile = (fieldName) => {
+                const f = req.files && req.files.find(f => f.fieldname === fieldName);
+                return f ? f.path.replace(/\\/g, '/') : null;
+            };
+
+            const otherDocs = (req.files || [])
+                .filter(f => f.fieldname.startsWith('other_doc_'))
+                .map(f => ({ name: f.fieldname.replace('other_doc_', ''), path: f.path.replace(/\\/g, '/') }));
+
+            const expVal = (String(has_experience) === '1' || has_experience === true || has_experience === 'true') ? 1 : 0;
+
+            const [result] = await pool.execute(
+                `INSERT INTO staff_records (
+                    employee_id, name, personal_email, phone, dob, doj,
+                    blood_group, department, designation, emergency_contact, address, has_experience,
+                    aadhar_path, pan_path, self_attestation_path, degree_path, bank_details_path,
+                    resume_path, offer_letter_path, experience_cert_path, payslip_path, other_doc_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    employee_id || null, name.trim(), personal_email || null, phone.trim(),
+                    dob || null, doj || null, blood_group || null, department || null,
+                    designation || null, emergency_contact || null, address || null, expVal,
+                    getFile('aadhar'), getFile('pan'), getFile('self_attestation'), getFile('degree'),
+                    getFile('bank_details'), getFile('resume'), getFile('offer_letter'),
+                    getFile('experience_cert'), getFile('payslip'),
+                    otherDocs.length > 0 ? JSON.stringify(otherDocs) : null
+                ]
+            );
+
+            // Log History
+            await pool.execute(
+                `INSERT INTO staff_records_history (staff_record_id, action_type, action_details, performed_by) VALUES (?, ?, ?, ?)`,
+                [result.insertId, 'CREATED', 'Staff record created.', req.user.email || 'Admin']
+            );
+
+            res.status(201).json({ msg: 'Staff record created', id: result.insertId });
+        } catch (err) {
+            console.error('Create staff record error:', err);
+            res.status(500).json({ error: 'Failed to create staff record' });
+        }
+    });
+});
+
+// PUT update staff record
+app.put('/api/staff-records/:id', authenticateToken, (req, res) => {
+    const cpUpload = uploadStaffDocs.any();
+    cpUpload(req, res, async (err) => {
+        if (err) return res.status(400).json({ msg: `Upload error: ${err.message}` });
+        if (getUserTier(req.user) !== 'SUPER_ADMIN') return res.status(403).json({ msg: 'Access Denied' });
+
+        const { id } = req.params;
+        const {
+            employee_id, name, personal_email, phone, dob, doj,
+            blood_group, department, designation, emergency_contact, address, has_experience,
+            delete_other_docs
+        } = req.body;
+
+        if (!name || !name.trim()) return res.status(400).json({ msg: 'Full name is required' });
+
+        try {
+            const [existing] = await pool.execute('SELECT * FROM staff_records WHERE id = ?', [id]);
+            if (existing.length === 0) return res.status(404).json({ msg: 'Staff record not found' });
+            const ex = existing[0];
+
+            const getFile = (fieldName) => {
+                const f = req.files && req.files.find(f => f.fieldname === fieldName);
+                return f ? f.path.replace(/\\/g, '/') : null;
+            };
+
+            const expVal = (String(has_experience) === '1' || has_experience === true || has_experience === 'true') ? 1 : 0;
+
+            // Handle other docs: keep existing, append new, remove deleted
+            let otherDocsArray = [];
+            if (ex.other_doc_path) {
+                try { otherDocsArray = JSON.parse(ex.other_doc_path); } catch { }
+            }
+            if (delete_other_docs) {
+                const toDelete = JSON.parse(delete_other_docs);
+                otherDocsArray = otherDocsArray.filter(d => !toDelete.includes(d.path));
+            }
+            const newOtherDocs = (req.files || [])
+                .filter(f => f.fieldname.startsWith('other_doc_'))
+                .map(f => ({ name: f.fieldname.replace('other_doc_', ''), path: f.path.replace(/\\/g, '/') }));
+            otherDocsArray.push(...newOtherDocs);
+
+            // Build a list of changes
+            let changes = [];
+            if (employee_id && employee_id !== ex.employee_id) changes.push(`Emp ID changed from "${ex.employee_id || 'N/A'}" to "${employee_id}"`);
+            if (name && name.trim() !== ex.name) changes.push(`Name changed from "${ex.name || 'N/A'}" to "${name.trim()}"`);
+            if (personal_email && personal_email !== ex.personal_email) changes.push(`Email changed from "${ex.personal_email || 'N/A'}" to "${personal_email}"`);
+            if (phone && phone.trim() !== ex.phone) changes.push(`Phone changed from "${ex.phone || 'N/A'}" to "${phone.trim()}"`);
+
+            const formatD = d => d ? new Date(d).toISOString().split('T')[0] : null;
+            if (dob && dob !== formatD(ex.dob)) changes.push(`DOB changed from "${formatD(ex.dob) || 'N/A'}" to "${dob}"`);
+            if (doj && doj !== formatD(ex.doj)) changes.push(`DOJ changed from "${formatD(ex.doj) || 'N/A'}" to "${doj}"`);
+            if (blood_group && blood_group !== ex.blood_group) changes.push(`Blood Group changed from "${ex.blood_group || 'N/A'}" to "${blood_group}"`);
+            if (department && department !== ex.department) changes.push(`Department changed from "${ex.department || 'N/A'}" to "${department}"`);
+            if (designation && designation !== ex.designation) changes.push(`Designation changed from "${ex.designation || 'N/A'}" to "${designation}"`);
+            if (emergency_contact && emergency_contact !== ex.emergency_contact) changes.push(`Emergency Contact changed from "${ex.emergency_contact || 'N/A'}" to "${emergency_contact}"`);
+            if (address && address !== ex.address) changes.push(`Address changed from "${ex.address || 'N/A'}" to "${address}"`);
+            if (expVal !== ex.has_experience) changes.push(`Experience set from "${ex.has_experience ? 'Yes' : 'No'}" to "${expVal ? 'Yes' : 'No'}"`);
+
+            const checkF = (k, label) => { if (getFile(k)) changes.push(`New ${label} uploaded`); };
+            checkF('aadhar', 'Aadhar');
+            checkF('pan', 'PAN');
+            checkF('self_attestation', 'Self Attestation');
+            checkF('degree', 'Degree');
+            checkF('bank_details', 'Bank Details');
+            checkF('resume', 'Resume');
+            checkF('offer_letter', 'Offer Letter');
+            checkF('experience_cert', 'Experience Cert');
+            checkF('payslip', 'Payslip');
+
+            if (newOtherDocs.length > 0) changes.push(`${newOtherDocs.length} extra doc(s) added`);
+            if (delete_other_docs && JSON.parse(delete_other_docs).length > 0) changes.push(`${JSON.parse(delete_other_docs).length} extra doc(s) removed`);
+
+            let actionDetailStr = changes.length > 0 ? changes.join(' | ') : 'Staff record updated without data changes.';
+
+            await pool.execute(
+                `UPDATE staff_records SET
+                    employee_id = ?, name = ?, personal_email = ?, phone = ?, dob = ?, doj = ?,
+                    blood_group = ?, department = ?, designation = ?, emergency_contact = ?, address = ?, has_experience = ?,
+                    aadhar_path = ?, pan_path = ?, self_attestation_path = ?, degree_path = ?,
+                    bank_details_path = ?, resume_path = ?, offer_letter_path = ?, experience_cert_path = ?,
+                    payslip_path = ?, other_doc_path = ?
+                WHERE id = ?`,
+                [
+                    employee_id || null, name.trim(), personal_email || null, phone.trim() || ex.phone,
+                    dob || null, doj || null, blood_group || null, department || null,
+                    designation || null, emergency_contact || null, address || null, expVal,
+                    getFile('aadhar') || ex.aadhar_path,
+                    getFile('pan') || ex.pan_path,
+                    getFile('self_attestation') || ex.self_attestation_path,
+                    getFile('degree') || ex.degree_path,
+                    getFile('bank_details') || ex.bank_details_path,
+                    getFile('resume') || ex.resume_path,
+                    getFile('offer_letter') || ex.offer_letter_path,
+                    getFile('experience_cert') || ex.experience_cert_path,
+                    getFile('payslip') || ex.payslip_path,
+                    otherDocsArray.length > 0 ? JSON.stringify(otherDocsArray) : null,
+                    id
+                ]
+            );
+
+            // Log History
+            await pool.execute(
+                `INSERT INTO staff_records_history (staff_record_id, action_type, action_details, performed_by) VALUES (?, ?, ?, ?)`,
+                [id, 'UPDATED', actionDetailStr, req.user.email || 'Admin']
+            );
+
+            res.json({ msg: 'Staff record updated' });
+        } catch (err) {
+            console.error('Update staff record error:', err);
+            res.status(500).json({ error: 'Failed to update staff record' });
+        }
+    });
+});
+
+// DELETE staff record
+app.delete('/api/staff-records/:id', authenticateToken, async (req, res) => {
+    if (getUserTier(req.user) !== 'SUPER_ADMIN') return res.status(403).json({ msg: 'Access Denied' });
+    const { id } = req.params;
+    try {
+        const [existing] = await pool.execute('SELECT name FROM staff_records WHERE id = ?', [id]);
+        if (existing.length === 0) return res.status(404).json({ msg: 'Record not found' });
+
+        const [result] = await pool.execute('DELETE FROM staff_records WHERE id = ?', [id]);
+
+        // Log History (though if CASCADE is on, it might delete the history, but let's record it if CASCADE is disabled or for reference)
+        // Actually, if ON DELETE CASCADE is set, inserting after won't work if FK constraints are enforced. 
+        // We will just return. The history is deleted.
+
+        res.json({ msg: 'Staff record deleted' });
+    } catch (err) {
+        console.error('Delete staff record error:', err);
+        res.status(500).json({ error: 'Failed to delete staff record' });
+    }
+});
+
+// GET staff record history
+app.get('/api/staff-records/:id/history', authenticateToken, async (req, res) => {
+    if (getUserTier(req.user) !== 'SUPER_ADMIN') return res.status(403).json({ msg: 'Access Denied' });
+    const { id } = req.params;
+    try {
+        const [rows] = await pool.execute(
+            `SELECT id, action_type, action_details, performed_by, performed_at 
+             FROM staff_records_history 
+             WHERE staff_record_id = ? 
+             ORDER BY performed_at DESC`,
+            [id]
+        );
+        res.json(rows);
+    } catch (err) {
+        console.error('Fetch staff history error:', err);
+        res.status(500).json({ error: 'Failed to fetch staff history' });
+    }
+});
+
+// ==========================================
+// MEDIA GALLERY ROUTES
+// ==========================================
+
+// GET all media
+app.get('/api/media', authenticateToken, async (req, res) => {
+    if (getUserTier(req.user) !== 'SUPER_ADMIN' && getUserTier(req.user) !== 'ADMIN') {
+        return res.status(403).json({ msg: 'Access Denied' });
+    }
+    const { domain, category, period } = req.query;
+
+    let query = 'SELECT * FROM media_gallery WHERE 1=1';
+    let params = [];
+
+    if (domain && domain !== 'all') {
+        query += ' AND domain_name = ?';
+        params.push(domain);
+    }
+    if (category && category !== 'all') {
+        query += ' AND category = ?';
+        params.push(category);
+    }
+    if (period && period !== 'all') {
+        query += ' AND period_year = ?';
+        params.push(period);
+    }
+
+    query += ' ORDER BY upload_date DESC';
+
+    try {
+        const [rows] = await pool.execute(query, params);
+        res.json(rows);
+    } catch (err) {
+        console.error('Fetch media error:', err);
+        res.status(500).json({ error: 'Failed to fetch media' });
+    }
+});
+
+// POST create media
+app.post('/api/media', uploadMedia.single('file'), async (req, res) => {
+    if (!req.user && req.headers.authorization) {
+        try {
+            const token = req.headers.authorization.split(' ')[1];
+            req.user = jwt.verify(token, JWT_SECRET);
+        } catch (err) {
+            req.user = null;
+        }
+    }
+
+    if (req.user && getUserTier(req.user) !== 'SUPER_ADMIN' && getUserTier(req.user) !== 'ADMIN') {
+        return res.status(403).json({ msg: 'Access Denied' });
+    }
+
+    if (!req.file) return res.status(400).json({ msg: 'No file uploaded' });
+
+    const { domain, category, period, customPeriod, month, title } = req.body;
+
+    if (!domain) return res.status(400).json({ msg: 'Domain is required' });
+    if (!category) return res.status(400).json({ msg: 'Category is required' });
+
+    const fileCategory = getMediaFileCategory(req.file.mimetype);
+    const sizeLimits = { image: 5, video: 200, document: 20 }; // in MB
+    const maxMB = sizeLimits[fileCategory];
+    const resolvedPeriod = period === 'custom' ? (customPeriod || null) : (period || null);
+
+    try {
+        await ensureMediaGalleryColumns();
+
+        let uploadedFile = req.file;
+        if (fileCategory === 'image') {
+            try {
+                const compressed = await compressImageIfNeeded(req.file.path, req.file.originalname, req.file.mimetype);
+                uploadedFile = {
+                    ...req.file,
+                    path: compressed.path,
+                    filename: compressed.filename,
+                    size: compressed.size
+                };
+            } catch (compressionErr) {
+                console.warn('Image compression skipped:', compressionErr.message);
+                uploadedFile = req.file;
+            }
+        }
+
+        if (uploadedFile.size > maxMB * 1024 * 1024) {
+            fs.unlink(uploadedFile.path, () => { });
+            return res.status(400).json({ msg: `File too large. Max size for ${fileCategory}s is ${maxMB}MB.` });
+        }
+
+        const filePath = uploadedFile.path.replace(/\\/g, '/');
+        const [result] = await pool.execute(
+            'INSERT INTO media_gallery (domain_name, category, period_year, month, file_path, title) VALUES (?, ?, ?, ?, ?, ?)',
+            [domain, category, resolvedPeriod, month || null, filePath, title || null]
+        );
+        res.status(201).json({ msg: 'Media uploaded successfully', id: result.insertId });
+    } catch (err) {
+        console.error('Upload media error:', err);
+        res.status(500).json({ error: err.message || 'Failed to upload media' });
+    }
+});
+
+app.put('/api/media/:id', async (req, res) => {
+    if (!req.user && req.headers.authorization) {
+        try {
+            const token = req.headers.authorization.split(' ')[1];
+            req.user = jwt.verify(token, JWT_SECRET);
+        } catch (err) {
+            req.user = null;
+        }
+    }
+
+    if (req.user && getUserTier(req.user) !== 'SUPER_ADMIN' && getUserTier(req.user) !== 'ADMIN') {
+        return res.status(403).json({ msg: 'Access Denied' });
+    }
+
+    const { id } = req.params;
+    const { domain, category, period, customPeriod, month, title } = req.body;
+    const resolvedPeriod = period === 'custom' ? (customPeriod || null) : (period || null);
+
+    try {
+        await ensureMediaGalleryColumns();
+        await pool.execute(
+            'UPDATE media_gallery SET domain_name = ?, category = ?, period_year = ?, month = ?, title = ? WHERE id = ?',
+            [domain, category, resolvedPeriod, month || null, title || null, id]
+        );
+        res.json({ msg: 'Media updated successfully' });
+    } catch (err) {
+        console.error('Update media error:', err);
+        res.status(500).json({ error: 'Failed to update media' });
+    }
+});
+
+// DELETE media
+app.delete('/api/media/:id', async (req, res) => {
+    if (!req.user && req.headers.authorization) {
+        try {
+            const token = req.headers.authorization.split(' ')[1];
+            req.user = jwt.verify(token, JWT_SECRET);
+        } catch (err) {
+            req.user = null;
+        }
+    }
+
+    if (req.user && getUserTier(req.user) !== 'SUPER_ADMIN' && getUserTier(req.user) !== 'ADMIN') {
+        return res.status(403).json({ msg: 'Access Denied' });
+    }
+
+    const { id } = req.params;
+
+    try {
+        const [existing] = await pool.execute('SELECT file_path FROM media_gallery WHERE id = ?', [id]);
+        if (existing.length === 0) return res.status(404).json({ msg: 'Media not found' });
+
+        await pool.execute('DELETE FROM media_gallery WHERE id = ?', [id]);
+
+        // Optionally, delete file from filesystem
+        const fs = require('fs');
+        const path = require('path');
+        const fullPath = path.join(__dirname, existing[0].file_path);
+        if (fs.existsSync(fullPath)) {
+            fs.unlinkSync(fullPath);
+        }
+
+        res.json({ msg: 'Media deleted successfully' });
+    } catch (err) {
+        console.error('Delete media error:', err);
+        res.status(500).json({ error: 'Failed to delete media' });
+    }
 });
 
 // ==========================================
@@ -4973,6 +5896,77 @@ app.get('/api/leads/:id/document-requirements', authenticateToken, async (req, r
     }
 });
 
+// ── CANDIDATE PHOTO ─────────────────────────────────────────────────────────
+// GET: fetch current photo URL for a lead
+app.get('/api/leads/:id/photo', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const [rows] = await pool.execute('SELECT candidate_photo FROM leads WHERE id = ?', [id]);
+        if (!rows.length) return res.status(404).json({ error: 'Lead not found' });
+        res.json({ photo_url: rows[0].candidate_photo || null });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST: upload / replace candidate photo (images only, 5 MB max)
+const uploadPhoto = multer({
+    storage: multer.diskStorage({
+        destination: (req, file, cb) => {
+            const photoDir = path.join(__dirname, 'uploads/photos');
+            if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+            cb(null, 'uploads/photos');
+        },
+        filename: (req, file, cb) => {
+            const ext = path.extname(file.originalname).toLowerCase();
+            cb(null, `lead_${req.params.id}_${Date.now()}${ext}`);
+        }
+    }),
+    limits: { fileSize: 20 * 1024 * 1024 }, // 20 MB max
+    fileFilter: (req, file, cb) => {
+        const allowed = ['image/jpeg', 'image/png', 'image/webp'];
+        if (allowed.includes(file.mimetype)) cb(null, true);
+        else cb(new Error('Only JPEG, PNG, or WEBP images are allowed'));
+    }
+});
+
+app.post('/api/leads/:id/photo', authenticateToken, (req, res, next) => {
+    uploadPhoto.single('photo')(req, res, (err) => {
+        if (err instanceof multer.MulterError) {
+            return res.status(400).json({ error: `Upload error: ${err.message}` });
+        } else if (err) {
+            return res.status(400).json({ error: err.message });
+        }
+        next();
+    });
+}, async (req, res) => {
+    const { id } = req.params;
+    if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
+    try {
+        const photoUrl = `uploads/photos/${req.file.filename}`;
+        await pool.execute('UPDATE leads SET candidate_photo = ? WHERE id = ?', [photoUrl, id]);
+        res.json({ msg: 'Photo uploaded successfully', photo_url: photoUrl });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// DELETE: remove candidate photo
+app.delete('/api/leads/:id/photo', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const [rows] = await pool.execute('SELECT candidate_photo FROM leads WHERE id = ?', [id]);
+        if (rows[0]?.candidate_photo) {
+            const fullPath = path.join(__dirname, rows[0].candidate_photo);
+            if (fs.existsSync(fullPath)) fs.unlink(fullPath, () => {});
+        }
+        await pool.execute('UPDATE leads SET candidate_photo = NULL WHERE id = ?', [id]);
+        res.json({ msg: 'Photo removed' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.post('/api/leads/:id/documents/upload', authenticateToken, uploadDocuments.single('file'), async (req, res) => {
     const { id } = req.params;
     const { documentName, requirementId } = req.body;
@@ -4983,15 +5977,25 @@ app.post('/api/leads/:id/documents/upload', authenticateToken, uploadDocuments.s
     try {
         const filePath = `uploads/documents/${req.file.filename}`;
 
+        // Get lead details
+        const [leadRows] = await pool.execute('SELECT domain, student_name, lead_code FROM leads WHERE id = ?', [id]);
+        if (leadRows.length === 0) return res.status(404).json({ msg: "Lead not found" });
+        const lead = leadRows[0];
+        const isOverseas = lead.domain && lead.domain.toLowerCase() === 'overseas';
+
         // We use an UPSERT style logic: if requirementId exists for this lead, update it.
         // If no requirementId (ad-hoc), we always insert.
         if (requirementId) {
             const [existing] = await pool.execute(
-                'SELECT id FROM lead_documents WHERE lead_id = ? AND requirement_id = ?',
+                'SELECT id, file_path FROM lead_documents WHERE lead_id = ? AND requirement_id = ?',
                 [id, requirementId]
             );
 
             if (existing.length > 0) {
+                if (isOverseas) {
+                    return res.status(400).json({ msg: "Re-upload restricted for overseas candidates." });
+                }
+
                 await pool.execute(
                     `UPDATE lead_documents 
                      SET file_name = ?, file_path = ?, file_type = ?, status = 'Uploaded', 
@@ -4999,6 +6003,22 @@ app.post('/api/leads/:id/documents/upload', authenticateToken, uploadDocuments.s
                      WHERE id = ?`,
                     [req.file.originalname, filePath, req.file.mimetype, uploadedBy, existing[0].id]
                 );
+
+                // Send email notification after update
+                try {
+                    const transporter = createMailTransporter();
+                    if (transporter) {
+                        await transporter.sendMail({
+                            from: SMTP_CONFIG.from || SMTP_CONFIG.user,
+                            to: 'bluestoneocs@gmail.com, info@bluestoneocs.com, bluestonesoftwaredeveloper@gmail.com',
+                            subject: `Document Uploaded: ${documentName || req.file.originalname} for ${lead.student_name}`,
+                            text: `A document has been uploaded.\n\nCandidate: ${lead.student_name} (${lead.lead_code || id})\nDocument Name: ${documentName || req.file.originalname}\nFile Name: ${req.file.originalname}\nUploaded By: ${uploadedBy}\nDate: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+                        });
+                    }
+                } catch (e) {
+                    console.error("Failed to send document upload email:", e);
+                }
+
                 return res.json({ msg: "File updated successfully", filePath });
             }
         }
@@ -5009,8 +6029,129 @@ app.post('/api/leads/:id/documents/upload', authenticateToken, uploadDocuments.s
             VALUES (?, ?, ?, ?, ?, ?, 'Uploaded', ?, NOW())`,
             [id, requirementId || null, documentName, req.file.originalname, filePath, req.file.mimetype, uploadedBy]
         );
+
+        // Send email notification after insert
+        try {
+            const transporter = createMailTransporter();
+            if (transporter) {
+                await transporter.sendMail({
+                    from: SMTP_CONFIG.from || SMTP_CONFIG.user,
+                    to: 'bluestoneocs@gmail.com, info@bluestoneocs.com, bluestonesoftwaredeveloper@gmail.com',
+                    subject: `Document Uploaded: ${documentName || req.file.originalname} for ${lead.student_name}`,
+                    text: `A document has been uploaded.\n\nCandidate: ${lead.student_name} (${lead.lead_code || id})\nDocument Name: ${documentName || req.file.originalname}\nFile Name: ${req.file.originalname}\nUploaded By: ${uploadedBy}\nDate: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+                });
+            }
+        } catch (e) {
+            console.error("Failed to send document upload email:", e);
+        }
+
         res.json({ msg: "File uploaded successfully", filePath });
     } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Upload document with compose-style email notification
+app.post('/api/leads/:id/documents/upload-with-mail', authenticateToken, uploadDocuments.single('file'), async (req, res) => {
+    const { id } = req.params;
+    const { documentName, requirementId, subject, message, ccEmails } = req.body;
+    const uploadedBy = formatWho(req.user);
+
+    if (!req.file) return res.status(400).json({ msg: "No file uploaded" });
+
+    try {
+        const filePath = `uploads/documents/${req.file.filename}`;
+
+        // Get lead details
+        const [leadRows] = await pool.execute(
+            'SELECT domain, student_name, lead_code, email FROM leads WHERE id = ?',
+            [id]
+        );
+        if (leadRows.length === 0) return res.status(404).json({ msg: "Lead not found" });
+        const lead = leadRows[0];
+        const isOverseas = lead.domain && lead.domain.toLowerCase() === 'overseas';
+
+        // Save document to DB
+        if (requirementId) {
+            const [existing] = await pool.execute(
+                'SELECT id, file_path FROM lead_documents WHERE lead_id = ? AND requirement_id = ?',
+                [id, requirementId]
+            );
+            if (existing.length > 0) {
+                if (isOverseas && existing[0].file_path) {
+                    return res.status(400).json({ msg: "Re-upload restricted for overseas candidates." });
+                }
+                await pool.execute(
+                    `UPDATE lead_documents SET file_name=?, file_path=?, file_type=?, status='Uploaded', uploaded_by=?, uploaded_at=NOW() WHERE id=?`,
+                    [req.file.originalname, filePath, req.file.mimetype, uploadedBy, existing[0].id]
+                );
+            } else {
+                await pool.execute(
+                    `INSERT INTO lead_documents (lead_id, requirement_id, document_name, file_name, file_path, file_type, status, uploaded_by, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, 'Uploaded', ?, NOW())`,
+                    [id, requirementId, documentName, req.file.originalname, filePath, req.file.mimetype, uploadedBy]
+                );
+            }
+        } else {
+            await pool.execute(
+                `INSERT INTO lead_documents (lead_id, requirement_id, document_name, file_name, file_path, file_type, status, uploaded_by, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, 'Uploaded', ?, NOW())`,
+                [id, null, documentName, req.file.originalname, filePath, req.file.mimetype, uploadedBy]
+            );
+        }
+
+        // Send email notification
+        try {
+            const transporter = createMailTransporter();
+            if (transporter) {
+                const mailSubject = subject || `Document Uploaded: ${documentName || req.file.originalname} for ${lead.student_name}`;
+                const mailBody = message
+                    ? `${message}\n\n---\nCandidate: ${lead.student_name} (${lead.lead_code || id})\nDocument: ${documentName || req.file.originalname}\nUploaded By: ${uploadedBy}`
+                    : `A new document has been uploaded.\n\nCandidate: ${lead.student_name} (${lead.lead_code || id})\nDocument: ${documentName || req.file.originalname}\nUploaded By: ${uploadedBy}\nDate: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`;
+
+                const mailOptions = {
+                    from: SMTP_CONFIG.from || SMTP_CONFIG.user,
+                    to: 'bluestoneocs@gmail.com, info@bluestoneocs.com, bluestonesoftwaredeveloper@gmail.com',
+                    bcc: req.body.sendToCandidate === 'true' && lead.email ? lead.email : undefined,
+                    subject: mailSubject,
+                    text: mailBody,
+                    attachments: [{
+                        filename: req.file.originalname,
+                        path: path.join(__dirname, filePath)
+                    }]
+                };
+
+                await transporter.sendMail(mailOptions);
+            }
+        } catch (mailErr) {
+            console.error("Failed to send document upload mail:", mailErr);
+            // Don't fail the upload if mail fails
+        }
+
+        res.json({ msg: "File uploaded and notification sent", filePath });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/leads/:id/documents/notify-download', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const { filename } = req.body;
+    const downloadedBy = formatWho(req.user);
+
+    try {
+        const [leadRows] = await pool.execute('SELECT domain, student_name, lead_code FROM leads WHERE id = ?', [id]);
+        if (leadRows.length === 0) return res.status(404).json({ msg: "Lead not found" });
+        const lead = leadRows[0];
+        const isOverseas = lead.domain && lead.domain.toLowerCase() === 'overseas';
+
+        if (isOverseas) {
+            await transporter.sendMail({
+                from: "bluestonesoftwaredeveloper@gmail.com",
+                to: "bluestoneocs@gmail.com",
+                subject: `Document Downloaded: ${filename} for ${lead.student_name}`,
+                text: `A document has been downloaded for an Overseas candidate:\n\nCandidate: ${lead.student_name} (${lead.lead_code || id})\nDocument Name: ${filename}\nDownloaded By: ${downloadedBy}\nDate: ${new Date().toLocaleString()}`
+            });
+        }
+        res.json({ msg: "Notification sent" });
+    } catch (err) {
+        console.error("Failed to send download notification email:", err);
+        res.status(200).json({ msg: "Notification attempted", error: err.message });
+    }
 });
 
 app.post('/api/leads/:id/documents/checklist', authenticateToken, async (req, res) => {
@@ -5079,29 +6220,55 @@ app.delete('/api/leads/:id/documents/:docId', authenticateToken, async (req, res
 // EDIT LEAD (UPDATE)
 app.put('/api/leads/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
-    const { student_name, email, phone, category, interested_in, intake } = req.body;
+    const { 
+        student_name, email, phone, category, interested_in, intake, 
+        passport_no, university_student_id, university_name, 
+        urm_name, urm_phone, course_name, primary_status, secondary_status 
+    } = req.body;
     try {
         const [beforeRows] = await pool.query(
-            'SELECT student_name, email, phone, category, interested_in, intake FROM leads WHERE id = ?',
+            'SELECT student_name, email, phone, category, interested_in, intake, passport_no, university_student_id, university_name, urm_name, urm_phone, course_name, primary_status, secondary_status FROM leads WHERE id = ?',
             [id]
         );
         if (beforeRows.length === 0) {
             return res.status(404).json({ message: "Lead not found" });
         }
         const before = beforeRows[0];
-        const sql = `UPDATE leads SET student_name=?, email=?, phone=?, category=?, interested_in=?, intake=? WHERE id=?`;
-        const [result] = await pool.query(sql, [student_name, email, phone, category, interested_in, intake, id]);
+        
+        const sql = `UPDATE leads SET 
+            student_name=?, email=?, phone=?, category=?, interested_in=?, intake=?, 
+            passport_no=?, university_student_id=?, university_name=?, 
+            urm_name=?, urm_phone=?, course_name=?, primary_status=?, secondary_status=? 
+            WHERE id=?`;
+            
+        const params = [
+            student_name, email, phone, category, interested_in, intake,
+            passport_no || null, university_student_id || null, university_name || null,
+            urm_name || null, urm_phone || null, course_name || null, primary_status || null, secondary_status || null,
+            id
+        ];
+        
+        const [result] = await pool.query(sql, params);
         if (result.affectedRows === 0) {
             return res.status(404).json({ message: "Lead not found" });
         }
+        
         const changedBy = req.user?.name || 'System';
         const historyRows = [];
-        if ((before.student_name || '') !== (student_name || '')) historyRows.push([id, 'LEAD_EDIT', 'student_name', before.student_name || '', student_name || '', changedBy]);
-        if ((before.email || '') !== (email || '')) historyRows.push([id, 'LEAD_EDIT', 'email', before.email || '', email || '', changedBy]);
-        if ((before.phone || '') !== (phone || '')) historyRows.push([id, 'LEAD_EDIT', 'phone', before.phone || '', phone || '', changedBy]);
-        if ((before.category || '') !== (category || '')) historyRows.push([id, 'LEAD_EDIT', 'category', before.category || '', category || '', changedBy]);
-        if ((before.interested_in || '') !== (interested_in || '')) historyRows.push([id, 'LEAD_EDIT', 'interested_in', before.interested_in || '', interested_in || '', changedBy]);
-        if ((before.intake || '') !== (intake || '')) historyRows.push([id, 'LEAD_EDIT', 'intake', before.intake || '', intake || '', changedBy]);
+        const trackFields = [
+            'student_name', 'email', 'phone', 'category', 'interested_in', 'intake',
+            'passport_no', 'university_student_id', 'university_name',
+            'urm_name', 'urm_phone', 'course_name', 'primary_status', 'secondary_status'
+        ];
+        
+        for (const field of trackFields) {
+            const oldVal = before[field] || '';
+            const newVal = req.body[field] || '';
+            if (oldVal !== newVal) {
+                historyRows.push([id, 'LEAD_EDIT', field, oldVal, newVal, changedBy]);
+            }
+        }
+        
         for (const h of historyRows) {
             await pool.query(
                 `INSERT INTO lead_edit_history (lead_id, action_type, field_name, old_value, new_value, changed_by)
@@ -5156,6 +6323,13 @@ app.get('/api/dashboard/enquiry-trends', authenticateToken, async (req, res) => 
         if (company_name && company_name !== 'All') {
             where += ' AND company_name = ?';
             params.push(company_name);
+        }
+
+        // 0.5. Company Filter (Isolation for Agent/Franchise)
+        const loggedUserType = req.user.user_type || 'CORE';
+        if (loggedUserType === 'AGENT' || loggedUserType === 'FRANCHISE') {
+            where += ' AND company_name = ?';
+            params.push(req.user.company_name);
         }
 
         // 1. Staff/User Filter
@@ -5591,116 +6765,116 @@ const META_VERIFY_TOKEN = "mycrmverify123";
 const META_ACCESS_TOKEN = "EAAeDhwLj4GYBRk1wsXhwRHqU7chqv9DmY4uZCyRYGNUYiwl9te6kJtWClQJLrLDIW3tz4wb7oI5HDw4VqieCGZAhYX9Q4scU69zxuZBZBCUIVCySeYDuMG0vH8lqejd1d3euaN3VxdygqdqCi41afl4ybCj7Gn2mGKVEHdV9aY1sVQlvjHKUAqeyHt6QnSLSa9SWuJvY";
 
 const META_PAGE_DOMAIN_MAP = {
-  "443339626098796": "Bluestone Overseas",
-  "884912191368488": "Bluestone Techpark",
-  "835486679651886": "Bluestone International Pre School",
-  "902355596291561": "Bluestone Group of Institutions",
-  "960652620453721": "Bluestone Placements",
-  "798882103317956": "Bluestone Language Hub",
-  "794545177065914": "Bluestone Elite Sports",
-  "748860194967018": "Bluestoneiasacademy"
+    "443339626098796": "Bluestone Overseas",
+    "884912191368488": "Bluestone Techpark",
+    "835486679651886": "Bluestone International Pre School",
+    "902355596291561": "Bluestone Group of Institutions",
+    "960652620453721": "Bluestone Placements",
+    "798882103317956": "Bluestone Language Hub",
+    "794545177065914": "Bluestone Elite Sports",
+    "748860194967018": "Bluestoneiasacademy"
 };
 
 app.get('/meta-webhook', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
+    const mode = req.query['hub.mode'];
+    const token = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
 
-  if (mode === 'subscribe' && token === META_VERIFY_TOKEN) {
-    console.log("Meta webhook verification successful via server.js!");
-    return res.status(200).send(challenge);
-  } else {
-    console.warn(`Meta Webhook verification failed. Token mismatch.`);
-    return res.sendStatus(403);
-  }
+    if (mode === 'subscribe' && token === META_VERIFY_TOKEN) {
+        console.log("Meta webhook verification successful via server.js!");
+        return res.status(200).send(challenge);
+    } else {
+        console.warn(`Meta Webhook verification failed. Token mismatch.`);
+        return res.sendStatus(403);
+    }
 });
 
 app.post('/meta-webhook', async (req, res) => {
-  console.log("🚀 DEBUG 1: Webhook route triggered raw body:", JSON.stringify(req.body));
+    console.log("🚀 DEBUG 1: Webhook route triggered raw body:", JSON.stringify(req.body));
 
-  try {
-    const change = req.body.entry?.[0]?.changes?.[0];
-    const leadgen_id = change?.value?.leadgen_id;
-    const page_id = change?.value?.page_id || req.body.entry?.[0]?.id;
+    try {
+        const change = req.body.entry?.[0]?.changes?.[0];
+        const leadgen_id = change?.value?.leadgen_id;
+        const page_id = change?.value?.page_id || req.body.entry?.[0]?.id;
 
-    if (!leadgen_id) {
-      console.log("❌ DEBUG 2: Dropped request because no leadgen_id was found in payload.");
-      return res.sendStatus(200);
-    }
+        if (!leadgen_id) {
+            console.log("❌ DEBUG 2: Dropped request because no leadgen_id was found in payload.");
+            return res.sendStatus(200);
+        }
 
-    // 1. Dynamically find the target brand domain mapping based on incoming Page ID
-    let targetDomain = "Bluestone Overseas"; // Default fallback
-    if (page_id && META_PAGE_DOMAIN_MAP[page_id]) {
-      targetDomain = META_PAGE_DOMAIN_MAP[page_id];
-    }
+        // 1. Dynamically find the target brand domain mapping based on incoming Page ID
+        let targetDomain = "Bluestone Overseas"; // Default fallback
+        if (page_id && META_PAGE_DOMAIN_MAP[page_id]) {
+            targetDomain = META_PAGE_DOMAIN_MAP[page_id];
+        }
 
-    console.log(`✅ DEBUG 3: Extracted Leadgen ID: ${leadgen_id} | Dynamic Destination Brand: "${targetDomain}"`);
+        console.log(`✅ DEBUG 3: Extracted Leadgen ID: ${leadgen_id} | Dynamic Destination Brand: "${targetDomain}"`);
 
-    // Fetch details from Meta Graph API
-    console.log("🔄 DEBUG 4: Sending request to Meta Graph API...");
-    const response = await axios.get(
-      `https://graph.facebook.com/v25.0/${leadgen_id}`,
-      { params: { access_token: META_ACCESS_TOKEN } }
-    );
-    console.log("✅ DEBUG 5: Meta Graph API Response received.");
+        // Fetch details from Meta Graph API
+        console.log("🔄 DEBUG 4: Sending request to Meta Graph API...");
+        const response = await axios.get(
+            `https://graph.facebook.com/v25.0/${leadgen_id}`,
+            { params: { access_token: META_ACCESS_TOKEN } }
+        );
+        console.log("✅ DEBUG 5: Meta Graph API Response received.");
 
-    const fieldData = response.data.field_data;
-    if (!fieldData) {
-      console.warn("❌ DEBUG 6: Meta returned response but field_data array is completely missing.");
-      return res.sendStatus(200);
-    }
+        const fieldData = response.data.field_data;
+        if (!fieldData) {
+            console.warn("❌ DEBUG 6: Meta returned response but field_data array is completely missing.");
+            return res.sendStatus(200);
+        }
 
-    let lead = {};
-    fieldData.forEach(field => {
-      lead[field.name] = field.values[0];
-    });
+        let lead = {};
+        fieldData.forEach(field => {
+            lead[field.name] = field.values[0];
+        });
 
-    const finalLead = {
-      name: lead.full_name || lead.name || 'Meta User',
-      email: lead.email || '',
-      phone: lead.phone_number || lead.phone || '',
-      source: 'Facebook Ads'
-    };
-    console.log("📊 DEBUG 7: Flattened Lead object ready for database:", finalLead);
+        const finalLead = {
+            name: lead.full_name || lead.name || 'Meta User',
+            email: lead.email || '',
+            phone: lead.phone_number || lead.phone || '',
+            source: 'Facebook Ads'
+        };
+        console.log("📊 DEBUG 7: Flattened Lead object ready for database:", finalLead);
 
-    console.log(`🔄 DEBUG 8: Getting next lead code sequence for dynamic brand: "${targetDomain}"...`);
-    const leadCode = await getNextLeadCode(targetDomain); // FIXED: No longer hardcoded
-    console.log(`✅ DEBUG 9: Lead Code assigned: ${leadCode}`);
+        console.log(`🔄 DEBUG 8: Getting next lead code sequence for dynamic brand: "${targetDomain}"...`);
+        const leadCode = await getNextLeadCode(targetDomain); // FIXED: No longer hardcoded
+        console.log(`✅ DEBUG 9: Lead Code assigned: ${leadCode}`);
 
-    const nowStr = getISTString();
-    const insertQuery = `
+        const nowStr = getISTString();
+        const insertQuery = `
       INSERT INTO leads (student_name, email, phone, source, domain, status, lead_code, is_active, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
     `;
 
-    console.log(`🔄 DEBUG 10: Executing Database Insert Query for brand: "${targetDomain}"...`);
-    await pool.execute(insertQuery, [
-      finalLead.name,
-      finalLead.email,
-      finalLead.phone,
-      finalLead.source,
-      targetDomain, // FIXED: No longer hardcoded
-      'New',
-      leadCode,
-      nowStr
-    ]);
-    
-    console.log("🎉 DEBUG 11: SUCCESS! Database write confirmed.");
-    
-    // Trigger dynamic notifications
-    triggerEmails(finalLead.name, finalLead.email, finalLead.phone, 'Meta Lead Ads Enquiry', targetDomain, 'Meta Lead Ads', 'Facebook Ads');
-    
-    res.sendStatus(200);
+        console.log(`🔄 DEBUG 10: Executing Database Insert Query for brand: "${targetDomain}"...`);
+        await pool.execute(insertQuery, [
+            finalLead.name,
+            finalLead.email,
+            finalLead.phone,
+            finalLead.source,
+            targetDomain, // FIXED: No longer hardcoded
+            'New',
+            leadCode,
+            nowStr
+        ]);
 
-  } catch (error) {
-    console.error("🚨 CRITICAL BREAKDOWN LOGGED:");
-    if (error.response) {
-      console.error("Meta Graph API Server Error Details:", error.response.data);
-    } else {
-      console.error("Local Script/Database Error Message:", error.message);
+        console.log("🎉 DEBUG 11: SUCCESS! Database write confirmed.");
+
+        // Trigger dynamic notifications
+        triggerEmails(finalLead.name, finalLead.email, finalLead.phone, 'Meta Lead Ads Enquiry', targetDomain, 'Meta Lead Ads', 'Facebook Ads');
+
+        res.sendStatus(200);
+
+    } catch (error) {
+        console.error("🚨 CRITICAL BREAKDOWN LOGGED:");
+        if (error.response) {
+            console.error("Meta Graph API Server Error Details:", error.response.data);
+        } else {
+            console.error("Local Script/Database Error Message:", error.message);
+        }
+        res.sendStatus(200); // Keep sending 200 to Meta so they don't break your webhook connection stream
     }
-    res.sendStatus(200); // Keep sending 200 to Meta so they don't break your webhook connection stream
-  }
 });
 
 // ==========================================
@@ -5728,22 +6902,22 @@ app.get('/api/assets', authenticateToken, async (req, res) => {
 app.post('/api/assets', authenticateToken, async (req, res) => {
     try {
         const { category, asset_name, brand, model, login_username, login_password, approx_value, assigned_to, custom_assigned_name, has_charger } = req.body;
-        
+
         if (!category) return res.status(400).json({ msg: "Category is required" });
 
         const query = `
             INSERT INTO assets (category, asset_name, brand, model, login_username, login_password, approx_value, assigned_to, custom_assigned_name, has_charger)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
-        
+
         const params = [
-            category, 
-            asset_name || null, 
-            brand || null, 
-            model || null, 
-            login_username || null, 
-            login_password || null, 
-            approx_value || null, 
+            category,
+            asset_name || null,
+            brand || null,
+            model || null,
+            login_username || null,
+            login_password || null,
+            approx_value || null,
             assigned_to || null,
             custom_assigned_name || null,
             has_charger ? 1 : 0
@@ -5782,7 +6956,7 @@ app.put('/api/assets/:id', authenticateToken, async (req, res) => {
             // Trim and normalize values
             const nV = (newVal === undefined || newVal === null) ? "" : String(newVal).trim();
             const oV = (oldVal === undefined || oldVal === null) ? "" : String(oldVal).trim();
-            
+
             // Special handling for booleans/bit fields
             const finalNV = (field === 'has_charger') ? (newVal ? 1 : 0) : nV;
             const finalOV = (field === 'has_charger') ? (oldVal ? 1 : 0) : oV;
@@ -5807,12 +6981,12 @@ app.put('/api/assets/:id', authenticateToken, async (req, res) => {
         compare('approx_value', 'Value', approx_value, old.approx_value);
         compare('custom_assigned_name', 'Assigned Name', custom_assigned_name, old.custom_assigned_name);
         compare('has_charger', 'Charger', has_charger, old.has_charger);
-        
+
         // Handle staff assignment with names
         if (String(assigned_to || "") !== String(old.assigned_to || "")) {
             let oldStaffName = "Unassigned";
             let newStaffName = "Unassigned";
-            
+
             if (old.assigned_to) {
                 const [u] = await pool.execute("SELECT name FROM users WHERE id = ?", [old.assigned_to]);
                 if (u.length > 0) oldStaffName = u[0].name;
@@ -5831,15 +7005,15 @@ app.put('/api/assets/:id', authenticateToken, async (req, res) => {
             SET category = ?, asset_name = ?, brand = ?, model = ?, login_username = ?, login_password = ?, approx_value = ?, assigned_to = ?, custom_assigned_name = ?, has_charger = ?
             WHERE id = ?
         `;
-        
+
         const params = [
-            category, 
-            asset_name || null, 
-            brand || null, 
-            model || null, 
-            login_username || null, 
-            login_password || null, 
-            approx_value || null, 
+            category,
+            asset_name || null,
+            brand || null,
+            model || null,
+            login_username || null,
+            login_password || null,
+            approx_value || null,
             assigned_to || null,
             custom_assigned_name || null,
             has_charger ? 1 : 0,
@@ -6079,7 +7253,7 @@ app.post('/api/learning-resources/upload', authenticateToken, (req, res) => {
                 const file = req.files[idx];
                 const sizeInMB = (file.size / (1024 * 1024)).toFixed(2) + " MB";
                 const filePath = `uploads/documents/${file.filename}`;
-                
+
                 // Get title for this file
                 let finalTitle = titles[idx] || file.originalname;
                 // remove file extension from title if using originalname
@@ -6270,7 +7444,7 @@ app.put('/api/learning-resources/:id', authenticateToken, (req, res) => {
             if (oldRows.length === 0) {
                 return res.status(404).json({ msg: "Document not found" });
             }
-            
+
             const oldFilePath = oldRows[0].file_path;
 
             // If a new file is uploaded, process it
@@ -6278,7 +7452,7 @@ app.put('/api/learning-resources/:id', authenticateToken, (req, res) => {
                 const file = req.file;
                 const sizeInMB = (file.size / (1024 * 1024)).toFixed(2) + " MB";
                 const filePath = `uploads/documents/${file.filename}`;
-                
+
                 const dateStr = getISTString().split(' ')[0]; // Returns YYYY-MM-DD
                 const [y, m, d] = dateStr.split('-');
                 const formattedDate = `${d}-${m}-${y}`;
@@ -6328,6 +7502,145 @@ app.put('/api/learning-resources/:id', authenticateToken, (req, res) => {
     });
 });
 
+
+// --- NEW: OVERSEAS PIPELINE ENDPOINTS ---
+app.get('/api/overseas-pipeline', authenticateToken, async (req, res) => {
+    try {
+        const { role, domain: userDomain, id: loggedUserId } = req.user;
+        const isSuperAdmin = isSuperAdminUser(req.user);
+        
+        let sql = `SELECT * FROM leads WHERE is_active = 1 AND status = 'Enrolled'`;
+        const params = [];
+
+        // Apply domain filter for Overseas
+        sql = appendDomainCondition(sql, params, 'Overseas');
+
+        // Apply user constraints
+        if (!isSuperAdmin) {
+            // Must have Overseas in their domain access
+            const authorized = String(userDomain || '').split(',').map(d => d.trim().toLowerCase());
+            if (!authorized.some(d => d.includes('overseas') || d === 'all')) {
+                return res.status(403).json({ error: "Access denied. You do not have access to the Overseas domain." });
+            }
+        }
+        
+        // Apply staff filter
+        if (isStaffUser(req.user)) {
+            sql += " AND assigned_to = ?";
+            params.push(loggedUserId);
+        }
+        
+        // Apply company filter
+        const loggedUserType = req.user.user_type || 'CORE';
+        if (loggedUserType === 'AGENT' || loggedUserType === 'FRANCHISE') {
+            sql += ' AND company_name = ?';
+            params.push(req.user.company_name);
+        }
+        
+        sql += " ORDER BY created_at DESC";
+        
+        const [rows] = await pool.execute(sql, params);
+        res.json({ success: true, data: rows });
+    } catch (err) {
+        console.error("Pipeline Fetch Error:", err);
+        res.status(500).json({ error: "Failed to fetch pipeline leads" });
+    }
+});
+
+app.put('/api/leads/:id/pipeline-status', authenticateToken, async (req, res) => {
+    try {
+        const leadId = req.params.id;
+        const { status } = req.body;
+        
+        const allowedStatuses = [
+            'Document Collection', 
+            'University Applied', 
+            'Offer Received', 
+            'CAS / I-20 Processing', 
+            'Visa Processing', 
+            'Visa Approved',
+            'Completed'
+        ];
+        
+        if (!allowedStatuses.includes(status)) {
+            return res.status(400).json({ error: "Invalid pipeline status" });
+        }
+        
+        // Also check if user has edit permission
+        if (req.user.can_edit === 0) {
+            return res.status(403).json({ error: "You don't have permission to edit leads." });
+        }
+        
+        const finalStatus = status === 'Completed' ? 'Closed' : 'Enrolled';
+        await pool.execute(
+            'UPDATE leads SET overseas_pipeline_status = ?, status = ? WHERE id = ?',
+            [status, finalStatus, leadId]
+        );
+        
+        res.json({ success: true, message: "Pipeline status updated successfully" });
+    } catch (err) {
+        console.error("Pipeline Status Update Error:", err);
+        res.status(500).json({ error: "Failed to update pipeline status" });
+    }
+});
+
+app.post('/api/leads/bulk-pipeline-status', authenticateToken, async (req, res) => {
+    try {
+        const { leadIds, status, university_name, course_name, remarks } = req.body;
+        if (!leadIds || !Array.isArray(leadIds) || leadIds.length === 0) {
+            return res.status(400).json({ error: "No leads selected" });
+        }
+        
+        const allowedStatuses = [
+            'Document Collection', 
+            'University Applied', 
+            'Offer Received', 
+            'CAS / I-20 Processing', 
+            'Visa Processing', 
+            'Visa Approved',
+            'Completed'
+        ];
+        
+        if (!allowedStatuses.includes(status)) {
+            return res.status(400).json({ error: "Invalid pipeline status" });
+        }
+        
+        // Also check if user has edit permission
+        if (req.user.can_edit === 0) {
+            return res.status(403).json({ error: "You don't have permission to edit leads." });
+        }
+        
+        const placeholders = leadIds.map(() => '?').join(',');
+        
+        const finalStatus = status === 'Completed' ? 'Closed' : 'Enrolled';
+
+        let updateSql = `UPDATE leads SET overseas_pipeline_status = ?, status = ?`;
+        const params = [status, finalStatus];
+        
+        if (university_name) {
+            updateSql += `, university_name = ?`;
+            params.push(university_name);
+        }
+        if (course_name) {
+            updateSql += `, course_name = ?`;
+            params.push(course_name);
+        }
+        if (remarks) {
+            updateSql += `, remarks = CONCAT(IFNULL(remarks, ''), '\n[Pipeline Update]: ', ?)`;
+            params.push(remarks);
+        }
+        
+        updateSql += ` WHERE id IN (${placeholders})`;
+        params.push(...leadIds);
+        
+        await pool.execute(updateSql, params);
+        
+        res.json({ success: true, message: "Pipeline statuses updated successfully" });
+    } catch (err) {
+        console.error("Bulk Pipeline Status Update Error:", err);
+        res.status(500).json({ error: "Failed to bulk update pipeline status" });
+    }
+});
 
 const startServer = async () => {
     try {

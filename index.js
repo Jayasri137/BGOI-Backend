@@ -47,10 +47,10 @@ app.use('/bgoi_api/uploads', express.static(path.join(__dirname, 'uploads')));
     DATABASE & EMAIL CONFIG
 ================================ */
 const db = mysql.createPool({
-  host: '194.59.164.60', // Resolved from auth-db1278.hstgr.io
-  user: '',
-  password: '',
-  database: '',
+  host: 'auth-db1278.hstgr.io', // Resolved from auth-db1278.hstgr.io
+  user: 'u287260207_bgoi_user',
+  password: '4g@LMW2026',
+  database: 'u287260207_bgoi_bg',
   waitForConnections: true,
   connectionLimit: 10
 });
