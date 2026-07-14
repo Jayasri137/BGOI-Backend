@@ -192,8 +192,6 @@ async function ensureOverseasColumns() {
             'passport_no', 
             'university_student_id', 
             'university_name', 
-            'urm_name', 
-            'urm_phone', 
             'course_name', 
             'primary_status', 
             'secondary_status'
@@ -1196,6 +1194,11 @@ app.get('/api/dashboard/stats-bulk', authenticateToken, async (req, res) => {
                 SUM(CASE WHEN status = 'Enrolled' AND overseas_pipeline_status != 'Document Collection' THEN 1 ELSE 0 END) AS total_processed,
                 SUM(CASE WHEN status = 'Enrolled' AND overseas_pipeline_status = 'CAS / I-20 Processing' THEN 1 ELSE 0 END) AS total_cas_team,
                 SUM(CASE WHEN status = 'Closed' AND overseas_pipeline_status = 'Completed' THEN 1 ELSE 0 END) AS total_completed,
+                SUM(CASE WHEN status = 'Contacted' THEN 1 ELSE 0 END) AS total_contacted,
+                SUM(CASE WHEN status = 'Confirmed' THEN 1 ELSE 0 END) AS total_confirmed,
+                SUM(CASE WHEN status = 'Interested' THEN 1 ELSE 0 END) AS total_interested,
+                SUM(CASE WHEN status = 'Not Interested' THEN 1 ELSE 0 END) AS total_not_interested,
+                SUM(CASE WHEN status = 'New' THEN 1 ELSE 0 END) AS total_new,
                 SUM(CASE WHEN ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_enquiry,
                 SUM(CASE WHEN status = 'Follow Up' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_followup,
                 SUM(CASE WHEN payment_status IN ('Advance payment','Partial Payment','Full payment','No Fee') AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_enrolled,
@@ -1204,7 +1207,12 @@ app.get('/api/dashboard/stats-bulk', authenticateToken, async (req, res) => {
                 SUM(CASE WHEN status = 'Invalid' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_invalid,
                 SUM(CASE WHEN status = 'Enrolled' AND overseas_pipeline_status != 'Document Collection' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_processed,
                 SUM(CASE WHEN status = 'Enrolled' AND overseas_pipeline_status = 'CAS / I-20 Processing' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_cas_team,
-                SUM(CASE WHEN status = 'Closed' AND overseas_pipeline_status = 'Completed' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_completed
+                SUM(CASE WHEN status = 'Closed' AND overseas_pipeline_status = 'Completed' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_completed,
+                SUM(CASE WHEN status = 'Contacted' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_contacted,
+                SUM(CASE WHEN status = 'Confirmed' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_confirmed,
+                SUM(CASE WHEN status = 'Interested' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_interested,
+                SUM(CASE WHEN status = 'Not Interested' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_not_interested,
+                SUM(CASE WHEN status = 'New' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_new
             FROM leads
             WHERE ${where}
         `;
@@ -1220,6 +1228,11 @@ app.get('/api/dashboard/stats-bulk', authenticateToken, async (req, res) => {
             ...periodParams, // for period_processed
             ...periodParams, // for period_cas_team
             ...periodParams, // for period_completed
+            ...periodParams, // for period_contacted
+            ...periodParams, // for period_confirmed
+            ...periodParams, // for period_interested
+            ...periodParams, // for period_not_interested
+            ...periodParams, // for period_new
             ...baseParams    // for WHERE clause
         ];
 
@@ -1237,6 +1250,11 @@ app.get('/api/dashboard/stats-bulk', authenticateToken, async (req, res) => {
                 processed: Number(r.total_processed || 0),
                 cas_team: Number(r.total_cas_team || 0),
                 completed: Number(r.total_completed || 0),
+                contacted: Number(r.total_contacted || 0),
+                confirmed: Number(r.total_confirmed || 0),
+                interested: Number(r.total_interested || 0),
+                not_interested: Number(r.total_not_interested || 0),
+                new: Number(r.total_new || 0),
             },
             periods: {
                 enquiry: Number(r.period_enquiry || 0),
@@ -1248,14 +1266,19 @@ app.get('/api/dashboard/stats-bulk', authenticateToken, async (req, res) => {
                 processed: Number(r.period_processed || 0),
                 cas_team: Number(r.period_cas_team || 0),
                 completed: Number(r.period_completed || 0),
+                contacted: Number(r.period_contacted || 0),
+                confirmed: Number(r.period_confirmed || 0),
+                interested: Number(r.period_interested || 0),
+                not_interested: Number(r.period_not_interested || 0),
+                new: Number(r.period_new || 0),
             }
         });
     } catch (err) {
         console.error("Bulk Stats Error:", err);
         // Graceful fallback: return zeros so dashboard still loads
         res.status(200).json({
-            totals: { enquiry: 0, followup: 0, enrolled: 0, dropped: 0, pending: 0, invalid: 0, processed: 0, cas_team: 0, completed: 0 },
-            periods: { enquiry: 0, followup: 0, enrolled: 0, dropped: 0, pending: 0, invalid: 0, processed: 0, cas_team: 0, completed: 0},
+            totals: { enquiry: 0, followup: 0, enrolled: 0, dropped: 0, pending: 0, invalid: 0, processed: 0, cas_team: 0, completed: 0, contacted: 0, confirmed: 0, interested: 0, not_interested: 0, new: 0 },
+            periods: { enquiry: 0, followup: 0, enrolled: 0, dropped: 0, pending: 0, invalid: 0, processed: 0, cas_team: 0, completed: 0, contacted: 0, confirmed: 0, interested: 0, not_interested: 0, new: 0 },
             error: 'Stats temporarily unavailable'
         });
     }
@@ -1348,11 +1371,26 @@ app.get('/api/dashboard/financial-leads', authenticateToken, async (req, res) =>
             return res.status(403).json({ error: "Super Admin only." });
         }
 
-        const { domain, payment_status, page = 1, limit = 20 } = req.query;
+        const { domain, payment_status, page = 1, limit = 20, timeframe, date, startDate, endDate } = req.query;
         const offset = (Number(page) - 1) * Number(limit);
         const params = [];
 
         let where = `WHERE l.is_active = 1 AND l.deleted_at IS NULL AND l.status = 'Enrolled'`;
+        
+        if (timeframe === 'today' || (timeframe === 'history' && date)) {
+            where += ' AND DATE(l.created_at) = ?';
+            params.push(date || getISTDay());
+        } else if (timeframe === 'week') {
+            where += ' AND l.created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)';
+        } else if (timeframe === 'month') {
+            where += ' AND l.created_at >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)';
+        } else if (timeframe === 'year') {
+            where += ' AND l.created_at >= DATE_SUB(CURDATE(), INTERVAL 365 DAY)';
+        } else if (timeframe === 'custom' && startDate && endDate) {
+            where += ' AND DATE(l.created_at) BETWEEN ? AND ?';
+            params.push(startDate, endDate);
+        }
+
         if (domain && domain !== 'All') {
             where = appendDomainCondition(where, params, domain, 'l');
         }
@@ -1630,7 +1668,7 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
                     interested_in, remarks, lead_code, status, is_active, 
                     payment_status, total_fees, paid_amount,
                     assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake, created_at,
-                    passport_no, university_student_id, university_name, urm_name, urm_phone, course_name, primary_status, secondary_status, overseas_pipeline_status
+                    passport_no, university_student_id, university_name, course_name, primary_status, secondary_status, overseas_pipeline_status
                 FROM leads
                 WHERE is_active = 1
                 
@@ -1661,7 +1699,7 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
                     NULL AS intake,
                     e.created_at,
                     NULL AS passport_no, NULL AS university_student_id, NULL AS university_name, 
-                    NULL AS urm_name, NULL AS urm_phone, NULL AS course_name, 
+                    NULL AS course_name, 
                     NULL AS primary_status, NULL AS secondary_status, NULL AS overseas_pipeline_status
                 FROM bgoi_enquiries e
                 LEFT JOIN users u ON e.user_id = u.id
@@ -1813,9 +1851,9 @@ async function sendAgentNotification(agentId, leadDetails, isBulk = false, bulkC
 
 app.post('/api/leads', async (req, res) => {
     const { 
-        student_name, email, phone, domain, category, source, interested_in, remarks, 
+        student_name, email, phone, alternate_phone, domain, category, source, interested_in, remarks, 
         assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake, passport_number,
-        passport_no, university_student_id, university_name, urm_name, urm_phone, course_name, primary_status, secondary_status
+        passport_no, university_student_id, university_name, course_name, primary_status, secondary_status
     } = req.body;
 
     // Optional Auth for Portal users
@@ -1865,13 +1903,13 @@ app.post('/api/leads', async (req, res) => {
 
         await pool.execute(
             `INSERT INTO leads 
-            (student_name, passport_number, email, phone, domain, category, source, interested_in, remarks, lead_code, status, is_active, payment_status, assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake, created_at,
-             passport_no, university_student_id, university_name, urm_name, urm_phone, course_name, primary_status, secondary_status) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1, 'Pending payment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            (student_name, passport_number, email, phone, alternate_phone, domain, category, source, interested_in, remarks, lead_code, status, is_active, payment_status, assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake, created_at,
+             passport_no, university_student_id, university_name, course_name, primary_status, secondary_status) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1, 'Pending payment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
-                student_name, passport_number || null, email || null, phone || null, normalizedDomain, category || 'Standard Enquiry', source || 'Direct', interested_in || null, remarks || null, leadCode,
+                student_name, passport_number || null, email || null, phone || null, alternate_phone || null, normalizedDomain, category || 'Standard Enquiry', source || 'Direct', interested_in || null, remarks || null, leadCode,
                 assigned_to || null, assigned_to_name || null, assigned_by || null, assigned_by_name || null, finalSourceType, finalCompanyName, intake || null, nowStr,
-                passport_no || null, university_student_id || null, university_name || null, urm_name || null, urm_phone || null, course_name || null, primary_status || null, secondary_status || null
+                passport_no || null, university_student_id || null, university_name || null, course_name || null, primary_status || null, secondary_status || null
             ]
         );
         // ✅ AUTO-RESPONDER EMAIL
@@ -2414,6 +2452,41 @@ app.put('/api/leads/remarks', authenticateToken, async (req, res) => {
         });
     } catch (err) {
         console.error("Main Update Error:", err.message);
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// Update Franchise Comments
+app.put('/api/leads/franchise-comments', authenticateToken, async (req, res) => {
+    const { leadId, franchise_comments } = req.body;
+    const userName = req.user?.name || 'Staff'; 
+    try {
+        const [beforeRows] = await pool.execute('SELECT franchise_comments, lead_code FROM leads WHERE id = ?', [leadId]);
+        const oldComments = beforeRows[0]?.franchise_comments || '';
+        const leadCode = beforeRows[0]?.lead_code || `#${leadId}`;
+        const nowStr = getISTString();
+        
+        await pool.execute('UPDATE leads SET franchise_comments = ?, updated_at = ? WHERE id = ?', [franchise_comments || '', nowStr, leadId]);
+        
+        try {
+            await pool.execute(
+                `INSERT INTO lead_edit_history (lead_id, action_type, field_name, old_value, new_value, changed_by, changed_at)
+                 VALUES (?, 'FRANCHISE_COMMENTS_UPDATE', 'franchise_comments', ?, ?, ?, ?)`,
+                [leadId, oldComments, franchise_comments || '', userName, nowStr]
+            );
+        } catch (historyErr) {
+            console.error("History log failed, but comments were saved:", historyErr.message);
+        }
+
+        await createSystemNotification(`Franchise Comments updated for Candidate ${leadCode}`, req.user);
+
+        return res.status(200).json({
+            success: true,
+            msg: "Franchise comments updated successfully",
+            franchise_comments: franchise_comments
+        });
+    } catch (err) {
+        console.error("Franchise Comments Update Error:", err.message);
         return res.status(500).json({ success: false, error: err.message });
     }
 });
@@ -6223,11 +6296,11 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
     const { 
         student_name, email, phone, category, interested_in, intake, 
         passport_no, university_student_id, university_name, 
-        urm_name, urm_phone, course_name, primary_status, secondary_status 
+        course_name, primary_status, secondary_status 
     } = req.body;
     try {
         const [beforeRows] = await pool.query(
-            'SELECT student_name, email, phone, category, interested_in, intake, passport_no, university_student_id, university_name, urm_name, urm_phone, course_name, primary_status, secondary_status FROM leads WHERE id = ?',
+            'SELECT student_name, email, phone, category, interested_in, intake, passport_no, university_student_id, university_name, course_name, primary_status, secondary_status FROM leads WHERE id = ?',
             [id]
         );
         if (beforeRows.length === 0) {
@@ -6238,13 +6311,13 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
         const sql = `UPDATE leads SET 
             student_name=?, email=?, phone=?, category=?, interested_in=?, intake=?, 
             passport_no=?, university_student_id=?, university_name=?, 
-            urm_name=?, urm_phone=?, course_name=?, primary_status=?, secondary_status=? 
+            course_name=?, primary_status=?, secondary_status=? 
             WHERE id=?`;
             
         const params = [
             student_name, email, phone, category, interested_in, intake,
             passport_no || null, university_student_id || null, university_name || null,
-            urm_name || null, urm_phone || null, course_name || null, primary_status || null, secondary_status || null,
+            course_name || null, primary_status || null, secondary_status || null,
             id
         ];
         
@@ -6258,7 +6331,7 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
         const trackFields = [
             'student_name', 'email', 'phone', 'category', 'interested_in', 'intake',
             'passport_no', 'university_student_id', 'university_name',
-            'urm_name', 'urm_phone', 'course_name', 'primary_status', 'secondary_status'
+            'course_name', 'primary_status', 'secondary_status'
         ];
         
         for (const field of trackFields) {
