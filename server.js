@@ -204,6 +204,13 @@ async function ensureOverseasColumns() {
                 console.log(`Added missing column ${col} to leads table`);
             }
         }
+        
+        // Add College Contacts JSON column
+        const [ccCols] = await pool.query(`SHOW COLUMNS FROM leads LIKE 'college_contacts'`);
+        if (ccCols.length === 0) {
+            await pool.query(`ALTER TABLE leads ADD COLUMN college_contacts JSON DEFAULT NULL`);
+            console.log(`Added missing column college_contacts to leads table`);
+        }
     } catch (err) {
         console.error('Overseas columns check failed:', err.message);
     }
@@ -270,6 +277,7 @@ function getLeadCodePrefix(domain = '') {
     if (key.includes('preschool') || key.includes('pre school')) return 'BIPS';
     if (key.includes('startup') || key.includes('start-up')) return 'BSP';
     if (key.includes('group') || key.includes('institution')) return 'BGOI';
+    if (key.includes('college contact')) return 'BCC';
     return 'BGOI';
 }
 
@@ -285,6 +293,7 @@ function normalizeContactDomain(focus = '') {
     if (key.includes('preschool')) return 'Preschool';
     if (key.includes('startup') || key.includes('business')) return 'Startup';
     if (key.includes('group')) return 'Group of Institutions';
+    if (key.includes('college contact')) return 'College Contacts';
     return focus;
 }
 function parseFocusList(raw = '') {
@@ -355,6 +364,10 @@ function getDomainAliases(domainInput = '') {
             aliases.add('Group of Institutions');
             aliases.add('Bluestone Group');
         }
+        // 🔥 COLLEGE CONTACTS
+        if (key.includes('college contact') || key.includes('college contacts')) {
+            aliases.add('College Contacts');
+        }
         // fallback if this specific item didn't match any triggers
         let matched = false;
         if (key.includes('overseas')) matched = true;
@@ -366,6 +379,7 @@ function getDomainAliases(domainInput = '') {
         if (key.includes('preschool')) matched = true;
         if (key.includes('startup') || key.includes('business')) matched = true;
         if (key.includes('group') || key.includes('institution')) matched = true;
+        if (key.includes('college contact')) matched = true;
 
         if (!matched) {
             aliases.add(d);
@@ -1587,7 +1601,7 @@ async function attachOverseasDetails(leads) {
 
 // Fetch Leads (Used by DomainPage.jsx)
 app.get('/api/leads', authenticateToken, async (req, res) => {
-    const { domain, assignedTo, view, page = 1, limit = 10, source_type, company_name } = req.query;
+    const { domain, assignedTo, view, page = 1, limit = 10, source_type, company_name, source } = req.query;
     const pageNum = parseInt(page, 10) || 1;
     const limitNum = parseInt(limit, 10) || 10;
     const offset = (pageNum - 1) * limitNum;
@@ -1659,6 +1673,10 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
                 where += ' AND combined.source_type = ?';
                 filters.push(source_type);
             }
+        }
+        if (source && source !== 'All') {
+            where += ' AND (combined.source = ? OR combined.source LIKE ?)';
+            filters.push(source, `%${source}%`);
         }
 
         const baseSql = `
@@ -1853,7 +1871,8 @@ app.post('/api/leads', async (req, res) => {
     const { 
         student_name, email, phone, alternate_phone, domain, category, source, interested_in, remarks, 
         assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake, passport_number,
-        passport_no, university_student_id, university_name, course_name, primary_status, secondary_status
+        passport_no, university_student_id, university_name, course_name, primary_status, secondary_status,
+        college_contacts
     } = req.body;
 
     // Optional Auth for Portal users
@@ -1904,12 +1923,13 @@ app.post('/api/leads', async (req, res) => {
         await pool.execute(
             `INSERT INTO leads 
             (student_name, passport_number, email, phone, alternate_phone, domain, category, source, interested_in, remarks, lead_code, status, is_active, payment_status, assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake, created_at,
-             passport_no, university_student_id, university_name, course_name, primary_status, secondary_status) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1, 'Pending payment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             passport_no, university_student_id, university_name, course_name, primary_status, secondary_status, college_contacts) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1, 'Pending payment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 student_name, passport_number || null, email || null, phone || null, alternate_phone || null, normalizedDomain, category || 'Standard Enquiry', source || 'Direct', interested_in || null, remarks || null, leadCode,
                 assigned_to || null, assigned_to_name || null, assigned_by || null, assigned_by_name || null, finalSourceType, finalCompanyName, intake || null, nowStr,
-                passport_no || null, university_student_id || null, university_name || null, course_name || null, primary_status || null, secondary_status || null
+                passport_no || null, university_student_id || null, university_name || null, course_name || null, primary_status || null, secondary_status || null,
+                college_contacts && Array.isArray(college_contacts) ? JSON.stringify(college_contacts) : null
             ]
         );
         // ✅ AUTO-RESPONDER EMAIL
@@ -2918,7 +2938,8 @@ app.get('/api/leads/domain/:domainName', authenticateToken, async (req, res) => 
         startDate,
         endDate,
         company_name,
-        source_type
+        source_type,
+        source
     } = req.query;
     const pageNum = parseInt(page) || 1;
     const limitNum = parseInt(limit) || 10;
@@ -3001,6 +3022,19 @@ app.get('/api/leads/domain/:domainName', authenticateToken, async (req, res) => 
                 params.push(ps);
             }
         }
+        if (req.query.pipeline_status && req.query.pipeline_status !== 'All') {
+            const pls = req.query.pipeline_status;
+            if (pls === 'processed') {
+                where += " AND status = 'Enrolled' AND overseas_pipeline_status != 'Document Collection'";
+            } else if (pls === 'cas_team') {
+                where += " AND status = 'Enrolled' AND overseas_pipeline_status = 'CAS / I-20 Processing'";
+            } else if (pls === 'completed') {
+                where += " AND status = 'Closed' AND overseas_pipeline_status = 'Completed'";
+            } else {
+                where += ' AND overseas_pipeline_status = ?';
+                params.push(pls);
+            }
+        }
         if (source_type && source_type !== 'All') {
             if (source_type === 'Agent') {
                 where += " AND (source_type = 'Agent' OR (company_name IS NOT NULL AND company_name NOT IN ('-', 'Bluestone', 'BGOI', 'Bluestone Group of Institutions')))";
@@ -3010,6 +3044,10 @@ app.get('/api/leads/domain/:domainName', authenticateToken, async (req, res) => 
                 where += ' AND source_type = ?';
                 params.push(source_type);
             }
+        }
+        if (source && source !== 'All') {
+            where += ' AND (source = ? OR source LIKE ?)';
+            params.push(source, `%${source}%`);
         }
 
         // DATE FILTERS
@@ -5334,6 +5372,17 @@ app.delete('/api/media/:id', async (req, res) => {
 // 1. DOMAIN ROUTES
 // ==========================================
 // Get all domains
+app.get('/api/master/sources', authenticateToken, async (req, res) => {
+    try {
+        const [rows] = await pool.query(`SELECT DISTINCT source FROM leads WHERE source IS NOT NULL AND source != '' ORDER BY source ASC`);
+        const sources = rows.map(r => r.source);
+        res.json(sources);
+    } catch (err) {
+        console.error('Error fetching sources:', err);
+        res.status(500).json({ error: 'Failed to fetch sources' });
+    }
+});
+
 app.get('/api/master/domains', async (req, res) => {
     try {
         const [rows] = await pool.execute('SELECT * FROM master_domains ORDER BY COALESCE(sequence, 999999), name ASC');
@@ -6296,11 +6345,12 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
     const { 
         student_name, email, phone, category, interested_in, intake, 
         passport_no, university_student_id, university_name, 
-        course_name, primary_status, secondary_status 
+        course_name, primary_status, secondary_status,
+        college_contacts
     } = req.body;
     try {
         const [beforeRows] = await pool.query(
-            'SELECT student_name, email, phone, category, interested_in, intake, passport_no, university_student_id, university_name, course_name, primary_status, secondary_status FROM leads WHERE id = ?',
+            'SELECT student_name, email, phone, category, interested_in, intake, passport_no, university_student_id, university_name, course_name, primary_status, secondary_status, college_contacts FROM leads WHERE id = ?',
             [id]
         );
         if (beforeRows.length === 0) {
@@ -6311,13 +6361,14 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
         const sql = `UPDATE leads SET 
             student_name=?, email=?, phone=?, category=?, interested_in=?, intake=?, 
             passport_no=?, university_student_id=?, university_name=?, 
-            course_name=?, primary_status=?, secondary_status=? 
+            course_name=?, primary_status=?, secondary_status=?, college_contacts=? 
             WHERE id=?`;
             
         const params = [
             student_name, email, phone, category, interested_in, intake,
             passport_no || null, university_student_id || null, university_name || null,
             course_name || null, primary_status || null, secondary_status || null,
+            college_contacts ? JSON.stringify(college_contacts) : null,
             id
         ];
         
