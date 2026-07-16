@@ -219,6 +219,28 @@ async function ensureOverseasColumns() {
 ensureMediaGalleryColumns().catch(() => { });
 ensureOverseasColumns().catch(() => { });
 
+async function ensureRefundColumns() {
+    try {
+        const newColumns = [
+            { name: 'refund_status', type: "VARCHAR(50) DEFAULT 'Not Applicable'" },
+            { name: 'refund_amount', type: "DECIMAL(10, 2) DEFAULT 0.00" },
+            { name: 'refund_date', type: "DATETIME NULL" },
+            { name: 'refund_remarks', type: "TEXT NULL" }
+        ];
+        
+        for (const col of newColumns) {
+            const [columns] = await pool.query(`SHOW COLUMNS FROM leads LIKE '${col.name}'`);
+            if (columns.length === 0) {
+                await pool.query(`ALTER TABLE leads ADD COLUMN ${col.name} ${col.type}`);
+                console.log(`Added missing column ${col.name} to leads table`);
+            }
+        }
+    } catch (err) {
+        console.error('Refund columns check failed:', err.message);
+    }
+}
+ensureRefundColumns().catch(() => { });
+
 // Proactive Error Monitor
 pool.on('error', (err) => {
     console.error('[DATABASE POOL ERROR]:', err.message);
@@ -1329,15 +1351,18 @@ app.get('/api/dashboard/financial-stats', authenticateToken, async (req, res) =>
         const statsQuery = `
             SELECT
                 domain,
-                COUNT(*) as total_leads,
-                SUM(CASE WHEN payment_status = 'Full payment' THEN 1 ELSE 0 END) as paid_count,
-                SUM(CASE WHEN payment_status IN ('Partial Payment', 'Advance payment') THEN 1 ELSE 0 END) as partial_count,
-                SUM(CASE WHEN (payment_status = 'Pending payment' OR payment_status IS NULL OR payment_status = '' OR payment_status = 'Pending') THEN 1 ELSE 0 END) as pending_count,
-                SUM(COALESCE(total_fees, 0)) as total_fees,
+                SUM(CASE WHEN status = 'Enrolled' THEN 1 ELSE 0 END) as total_leads,
+                SUM(CASE WHEN status = 'Dropped' AND LOWER(payment_status) != 'no refund' THEN 1 ELSE 0 END) as dropped_count,
+                SUM(CASE WHEN refund_status IN ('Requested', 'Processing') THEN 1 ELSE 0 END) as refund_pending_count,
+                SUM(COALESCE(refund_amount, 0)) as total_refunded_amount,
+                SUM(CASE WHEN status = 'Enrolled' AND payment_status = 'Full payment' THEN 1 ELSE 0 END) as paid_count,
+                SUM(CASE WHEN status = 'Enrolled' AND payment_status IN ('Partial Payment', 'Advance payment') THEN 1 ELSE 0 END) as partial_count,
+                SUM(CASE WHEN status = 'Enrolled' AND (payment_status = 'Pending payment' OR payment_status IS NULL OR payment_status = '' OR payment_status = 'Pending') THEN 1 ELSE 0 END) as pending_count,
+                SUM(CASE WHEN status = 'Enrolled' THEN COALESCE(total_fees, 0) ELSE COALESCE(paid_amount, 0) END) as total_fees,
                 SUM(COALESCE(paid_amount, 0)) as paid_amount,
-                SUM(COALESCE(total_fees, 0) - COALESCE(paid_amount, 0)) as pending_amount
+                SUM(CASE WHEN status = 'Enrolled' THEN COALESCE(total_fees, 0) - COALESCE(paid_amount, 0) ELSE 0 END) as pending_amount
             FROM leads
-            WHERE is_active = 1 AND (deleted_at IS NULL) AND status = 'Enrolled' AND payment_status IN ('Advance payment','Partial Payment','Full payment','No Fee')
+            WHERE is_active = 1 AND (deleted_at IS NULL) AND status IN ('Enrolled', 'Dropped') AND (payment_status IN ('Advance payment','Partial Payment','Full payment','No Fee', 'No Refund') OR payment_status LIKE '%refund%')
             ${periodWhere}
             GROUP BY domain
         `;
@@ -1362,12 +1387,16 @@ app.get('/api/dashboard/financial-stats', authenticateToken, async (req, res) =>
             return {
                 domain: shortName, // Return short name for UI consistency
                 total_leads: stats ? Number(stats.total_leads) : 0,
+                dropped_count: stats ? Number(stats.dropped_count) : 0,
+                refund_pending_count: stats ? Number(stats.refund_pending_count) : 0,
+                total_refunded_amount: stats ? Number(stats.total_refunded_amount) : 0,
                 paid_count: stats ? Number(stats.paid_count) : 0,
                 partial_count: stats ? Number(stats.partial_count) : 0,
                 pending_count: stats ? Number(stats.pending_count) : 0,
                 total_fees: stats ? Number(stats.total_fees) : 0,
                 paid_amount: stats ? Number(stats.paid_amount) : 0,
-                pending_amount: stats ? Number(stats.pending_amount) : 0
+                pending_amount: stats ? Number(stats.pending_amount) : 0,
+                net_revenue: stats ? (Number(stats.paid_amount) - Number(stats.total_refunded_amount)) : 0
             };
         });
 
@@ -1389,7 +1418,7 @@ app.get('/api/dashboard/financial-leads', authenticateToken, async (req, res) =>
         const offset = (Number(page) - 1) * Number(limit);
         const params = [];
 
-        let where = `WHERE l.is_active = 1 AND l.deleted_at IS NULL AND l.status = 'Enrolled'`;
+        let where = `WHERE l.is_active = 1 AND l.deleted_at IS NULL`;
         
         if (timeframe === 'today' || (timeframe === 'history' && date)) {
             where += ' AND DATE(l.created_at) = ?';
@@ -1408,14 +1437,26 @@ app.get('/api/dashboard/financial-leads', authenticateToken, async (req, res) =>
         if (domain && domain !== 'All') {
             where = appendDomainCondition(where, params, domain, 'l');
         }
+        
         if (payment_status && payment_status !== 'All') {
             if (payment_status === 'Pending payment') {
-                // Pending payment includes null, empty, or explicitly "Pending payment"
-                where += ` AND (l.payment_status = 'Pending payment' OR l.payment_status IS NULL OR l.payment_status = '' OR l.payment_status = 'Pending')`;
+                where += ` AND l.status = 'Enrolled' AND (l.payment_status = 'Pending payment' OR l.payment_status IS NULL OR l.payment_status = '' OR l.payment_status = 'Pending')`;
+            } else if (payment_status === 'dropped_paid') {
+                where += ` AND l.status = 'Dropped' AND (l.payment_status IN ('Advance payment','Partial Payment','Full payment','No Fee') OR (l.payment_status LIKE '%refund%' AND LOWER(l.payment_status) != 'no refund')) AND LOWER(l.payment_status) != 'no refund'`;
+            } else if (payment_status === 'refunded') {
+                where += ` AND (l.refund_status IN ('Requested', 'Processing', 'Refunded') OR (l.payment_status LIKE '%refund%' AND LOWER(l.payment_status) != 'no refund'))`;
+            } else if (payment_status === 'enrolled_leads') {
+                where += ` AND l.status = 'Enrolled'`;
+            } else if (payment_status === 'collected') {
+                where += ` AND l.status = 'Enrolled' AND l.payment_status IN ('Advance payment','Partial Payment','Full payment')`;
+            } else if (payment_status === 'pending_dues') {
+                where += ` AND l.status = 'Enrolled' AND COALESCE(l.total_fees, 0) > COALESCE(l.paid_amount, 0)`;
             } else {
-                where += ` AND l.payment_status = ?`;
+                where += ` AND l.status = 'Enrolled' AND l.payment_status = ?`;
                 params.push(payment_status);
             }
+        } else {
+             where += ` AND l.status = 'Enrolled'`;
         }
 
         const countSql = `SELECT COUNT(*) as total FROM leads l ${where}`;
@@ -1428,6 +1469,7 @@ app.get('/api/dashboard/financial-leads', authenticateToken, async (req, res) =>
                 l.category, l.interested_in, l.payment_status,
                 l.total_fees, l.paid_amount,
                 (COALESCE(l.total_fees, 0) - COALESCE(l.paid_amount, 0)) AS pending_amount,
+                l.refund_status, l.refund_amount,
                 l.status, l.domain, l.assigned_to_name
             FROM leads l
             ${where}
@@ -2137,9 +2179,20 @@ app.put('/api/leads/:id/payment', authenticateToken, async (req, res) => {
             : before.extra_financials;
 
         const nowStr = getISTString();
+
+        let nextRefundStatus = before.refund_status || 'Not Applicable';
+        let nextRefundAmount = before.refund_amount || 0;
+
+        if (nextPaymentStatus === 'Fully refund') {
+            nextRefundStatus = 'Refunded';
+            nextRefundAmount = nextPaidAmount; // Full refund equals the total paid amount
+        } else if (nextPaymentStatus === 'Refund pending') {
+            nextRefundStatus = 'Requested';
+        }
+
         await pool.execute(
-            'UPDATE leads SET payment_status = ?, total_fees = ?, paid_amount = ?, status = ?, extra_financials = ?, updated_at = ? WHERE id = ?',
-            [nextPaymentStatus, nextTotalFees, nextPaidAmount, nextStatus, nextExtraFinancials, nowStr, id]
+            'UPDATE leads SET payment_status = ?, total_fees = ?, paid_amount = ?, status = ?, extra_financials = ?, refund_status = ?, refund_amount = ?, updated_at = ? WHERE id = ?',
+            [nextPaymentStatus, nextTotalFees, nextPaidAmount, nextStatus, nextExtraFinancials, nextRefundStatus, nextRefundAmount, nowStr, id]
         );
         const changedBy = req.user?.name || 'System';
         const historyRows = [];
