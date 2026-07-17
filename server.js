@@ -151,7 +151,7 @@ const SMTP_CONFIG = {
     secure: false, // true for 465
     user: 'bluestonesoftwaredeveloper@gmail.com',
     pass: 'hwmo dxbr oiub mpfr',
-    from: 'Bluestone CRM <bluestoneocs@gmail.com>'
+    from: 'Bluestone 360 <bluestoneocs@gmail.com>'
 };
 // --- 1. DATABASE CONNECTION ---
 const pool = mysql.createPool({
@@ -941,16 +941,16 @@ app.post('/api/auth/login', async (req, res) => {
         // Send Email Alert
         try {
             const mailOptions = {
-                from: '"Bluestone Security" <info@bluestoneocs.com>',
+                from: '"Bluestone 360 Security Alert" <info@bluestoneocs.com>',
                 to: 'bluestoneocs@gmail.com, admin@bluestoneocs.com, bluestonesoftwaredeveloper@gmail.com',
-                subject: `Security Alert: New CRM Login by ${user.name}`,
+                subject: `Security Alert: Bluestone 360 Login by ${user.name}`,
                 html: `
                     <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: 0 auto; border: 1px solid #ddd; border-radius: 8px; overflow: hidden;">
                         <div style="background-color: #003366; color: #fff; padding: 20px; text-align: center;">
-                            <h2>CRM Login Alert</h2>
+                            <h2>Bluestone 360</h2>
                         </div>
                         <div style="padding: 20px;">
-                            <p><strong>A user has just logged into the Bluestone CRM portal.</strong></p>
+                            <p><strong>A user has just logged into the Bluestone 360.</strong></p>
                             <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
                                 <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>Name</strong></td><td style="padding: 8px; border: 1px solid #ddd;">${user.name}</td></tr>
                                 <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>Email</strong></td><td style="padding: 8px; border: 1px solid #ddd;">${user.email}</td></tr>
@@ -961,7 +961,7 @@ app.post('/api/auth/login', async (req, res) => {
                             </table>
                         </div>
                         <div style="background-color: #f5f5f5; padding: 15px; text-align: center; font-size: 12px; color: #777;">
-                            <p>This is an automated security message from Bluestone Groups.</p>
+                            <p>This is an automated security message from Bluestone Group of Institutions.</p>
                         </div>
                     </div>
                 `
@@ -3126,7 +3126,7 @@ app.get('/api/leads/domain/:domainName', authenticateToken, async (req, res) => 
         // ✅ PERFORMANCE: Use LEFT JOIN instead of correlated subqueries (N+1 → single JOIN)
         let orderByClause;
         if (validSortBy === 'updated_at') {
-            orderByClause = `COALESCE(lrm_latest.latest_remark_at, l.created_at) ${validSortOrder}`;
+            orderByClause = `GREATEST(COALESCE(lrm_latest.latest_remark_at, l.created_at), COALESCE(l.updated_at, l.created_at)) ${validSortOrder}`;
         } else {
             orderByClause = `l.${validSortBy} ${validSortOrder}`;
         }
@@ -3134,7 +3134,7 @@ app.get('/api/leads/domain/:domainName', authenticateToken, async (req, res) => 
         const [rows] = await pool.execute(
             `SELECT l.*,
                 lrm_latest.latest_remark_subject,
-                lrm_latest.latest_remark_at AS updated_at
+                GREATEST(COALESCE(lrm_latest.latest_remark_at, l.created_at), COALESCE(l.updated_at, l.created_at)) AS updated_at
              FROM leads l
              LEFT JOIN (
                 SELECT lead_id,
@@ -3589,13 +3589,21 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
         const staffEmails = staffRows.map(u => u.email).filter(Boolean);
         const candidateEmail = lead.email;
 
+        // Add default assigned staff mail
+        let assignedStaffEmail = null;
+        if (lead.assigned_to) {
+            const [assignedUserRows] = await pool.execute('SELECT email FROM users WHERE id = ? AND is_active = 1', [lead.assigned_to]);
+            if (assignedUserRows.length > 0) assignedStaffEmail = assignedUserRows[0].email;
+        }
+
         // Strictly only what is selected or specifically requested (no automatic background CCs)
         const parsedCustomCc = Array.isArray(customCcEmails) ? customCcEmails : [];
         const allCCEmails = [...new Set([
             ...staffEmails,
             ...systemEmails,
             ...agentEmails,
-            ...parsedCustomCc
+            ...parsedCustomCc,
+            assignedStaffEmail
         ])].filter(Boolean);
 
         let parsedCustomTo = Array.isArray(customToEmails) ? customToEmails : [];
@@ -3632,12 +3640,8 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
         // Email HTML
         const html = `
       <div style="font-family: Arial, sans-serif;">
-        <h3>Lead Remark Update</h3>
-        <p><strong>Ref ID:</strong> ${lead.lead_code}</p>
         <p><strong>Candidate:</strong> ${lead.student_name || ""}</p>
-        <p><strong>Domain:</strong> ${lead.domain || ""}</p>
-        <p><strong>Subject:</strong> ${subject}</p>
-        <p><strong>Sent By:</strong> ${createdBy}</p>
+         <p><strong>Sent By:</strong> ${createdBy}</p>
         <p><strong>Description:</strong><br/>
         ${description.replace(/\n/g, "<br/>")}
         </p>
@@ -3655,7 +3659,7 @@ app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, r
                     to: finalTo,
                     cc: finalCC,
                     bcc: finalBCC,
-                    subject: `[Lead ${lead.lead_code || lead.id}] ${subject}`,
+                    subject: `[${lead.lead_code || lead.id}] ${subject}`,
                     html
                 };
                 // Attach file if present
@@ -3835,8 +3839,15 @@ app.put('/api/leads/:id/remark-messages/:messageId',
             const superAdminEmails = superAdmins.map(u => u.email).filter(Boolean);
             console.log(`Found ${superAdminEmails.length} super admins for CC (Edit):`, superAdminEmails);
 
+            // Add default assigned staff mail
+            let assignedStaffEmail = null;
+            if (lead.assigned_to) {
+                const [assignedUserRows] = await pool.execute('SELECT email FROM users WHERE id = ? AND is_active = 1', [lead.assigned_to]);
+                if (assignedUserRows.length > 0) assignedStaffEmail = assignedUserRows[0].email;
+            }
+
             const parsedCustomCc = Array.isArray(customCcEmails) ? customCcEmails : [];
-            const allCCEmails = [...new Set([...staffEmails, ...superAdminEmails, ...parsedCustomCc])].filter(Boolean);
+            const allCCEmails = [...new Set([...staffEmails, ...superAdminEmails, ...parsedCustomCc, assignedStaffEmail])].filter(Boolean);
 
             const finalTo = (primaryRecipientId === 'custom' && customToEmail) ? customToEmail : "info@bluestoneocs.com";
             const finalCC = allCCEmails.length > 0 ? allCCEmails.join(",") : null;
@@ -3856,13 +3867,10 @@ app.put('/api/leads/:id/remark-messages/:messageId',
             const createdBy = formatWho(req.user);
             const html = `
             <div style="font-family: Arial, sans-serif; line-height: 1.5;">
-                <h3>Lead Remark Update (Edited)</h3>
-                <p><strong>Ref ID:</strong> ${String(lead.lead_code)}</p>
-                <p><strong>Candidate:</strong> ${String(lead.student_name || '')}</p>
-                <p><strong>Domain:</strong> ${String(lead.domain || '')}</p>
-                <p><strong>Subject:</strong> ${String(subject)}</p>
-                <p><strong>Edited & Sent By:</strong> ${createdBy}</p>
+                <p><strong>Candidate:</strong> ${String(lead.student_name || '')}</p>  
+                 <p><strong>Edited & Sent By:</strong> ${createdBy}</p>         
                 <p><strong>Description:</strong><br/>${String(description).replace(/\n/g, '<br/>')}</p>
+                
             </div>
         `;
             let sentStatus = 'FAILED';
@@ -3877,7 +3885,7 @@ app.put('/api/leads/:id/remark-messages/:messageId',
                         to: finalTo,
                         cc: finalCC,
                         bcc: finalBCC,
-                        subject: `[Lead ${lead.lead_code || lead.id}] ${subject}`,
+                        subject: `[${lead.lead_code || lead.id}] ${subject}`,
                         html
                     };
                     if (attachment_base64) {
@@ -4642,16 +4650,16 @@ app.post('/api/security/log-violation', authenticateToken, async (req, res) => {
 
     try {
         // Formulate Email content nicely using HTML
-        const subject = `⚠️ Bluestone CRM Security Alert: ${actionType} Attempted by ${userObj.name}`;
+        const subject = `⚠️ Bluestone 360 Security Alert: ${actionType} Attempted by ${userObj.name}`;
         const htmlContent = `
             <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);">
                 <div style="background-color: #ef4444; color: #ffffff; padding: 20px; text-align: center;">
-                    <h2 style="margin: 0; font-size: 20px; text-transform: uppercase; letter-spacing: 1px;">Bluestone Security Alert</h2>
+                    <h2 style="margin: 0; font-size: 20px; text-transform: uppercase; letter-spacing: 1px;">Bluestone 360 Security Alert</h2>
                 </div>
                 <div style="padding: 24px; color: #334155;">
                     <p style="font-size: 16px; line-height: 1.5; margin-top: 0;">Dear Administrator,</p>
                     <p style="font-size: 14px; line-height: 1.6; color: #475569;">
-                        A security access violation was detected and successfully blocked inside the Bluestone Groups CRM. Details of the incident are below:
+                        A security access violation was detected and successfully blocked inside Bluestone 360. Details of the incident are below:
                     </p>
                     
                     <div style="background-color: #f8fafc; border-left: 4px solid #ef4444; padding: 16px; margin: 20px 0; border-radius: 4px;">
