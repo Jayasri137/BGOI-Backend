@@ -155,8 +155,8 @@ const SMTP_CONFIG = {
 };
 // --- 1. DATABASE CONNECTION ---
 const pool = mysql.createPool({
-    host: 'auth-db1278.hstgr.io',
-    // host: '194.59.164.60', // Resolved from auth-db1278.hstgr.io to bypass DNS issues
+    // host: 'auth-db1278.hstgr.io',
+    host: 'srv696.hstgr.io', // Resolved from auth-db1278.hstgr.io to bypass DNS issues
     user: 'u287260207_bgoi_user',
     password: '4g@LMW2026',
     database: 'u287260207_bgoi_bg',
@@ -175,6 +175,22 @@ async function query(sql, params = []) {
     return rows;
 }
 
+async function recordLeadEditHistory(leadId, fieldName, oldValue, newValue, changedBy, actionType = 'LEAD_EDIT') {
+    const normalize = value => {
+        if (value === undefined || value === null) return '';
+        return typeof value === 'object' ? JSON.stringify(value) : String(value);
+    };
+    const oldText = normalize(oldValue);
+    const newText = normalize(newValue);
+    if (oldText === newText) return;
+
+    await pool.execute(
+        `INSERT INTO lead_edit_history (lead_id, action_type, field_name, old_value, new_value, changed_by, changed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [leadId, actionType, fieldName, oldText, newText, changedBy || 'System', getISTString()]
+    );
+}
+
 async function ensureMediaGalleryColumns() {
     try {
         const [columns] = await pool.query("SHOW COLUMNS FROM media_gallery LIKE 'month'");
@@ -189,14 +205,14 @@ async function ensureMediaGalleryColumns() {
 async function ensureOverseasColumns() {
     try {
         const newColumns = [
-            'passport_no', 
-            'university_student_id', 
-            'university_name', 
-            'course_name', 
-            'primary_status', 
+            'passport_no',
+            'university_student_id',
+            'university_name',
+            'course_name',
+            'primary_status',
             'secondary_status'
         ];
-        
+
         for (const col of newColumns) {
             const [columns] = await pool.query(`SHOW COLUMNS FROM leads LIKE '${col}'`);
             if (columns.length === 0) {
@@ -204,7 +220,7 @@ async function ensureOverseasColumns() {
                 console.log(`Added missing column ${col} to leads table`);
             }
         }
-        
+
         // Add College Contacts JSON column
         const [ccCols] = await pool.query(`SHOW COLUMNS FROM leads LIKE 'college_contacts'`);
         if (ccCols.length === 0) {
@@ -227,7 +243,7 @@ async function ensureRefundColumns() {
             { name: 'refund_date', type: "DATETIME NULL" },
             { name: 'refund_remarks', type: "TEXT NULL" }
         ];
-        
+
         for (const col of newColumns) {
             const [columns] = await pool.query(`SHOW COLUMNS FROM leads LIKE '${col.name}'`);
             if (columns.length === 0) {
@@ -336,6 +352,7 @@ function getDomainAliases(domainInput = '') {
         if (key.includes('overseas')) {
             aliases.add('Overseas');
             aliases.add('Overseas Consulting');
+            aliases.add('Overseas Enrollment');
             aliases.add('Bluestone Overseas');
         }
         // 🔥 IAS
@@ -710,6 +727,49 @@ const initDB = async () => {
             await connection.query("ALTER TABLE leads ADD COLUMN candidate_photo VARCHAR(512) NULL");
         } catch (e) { /* Column already exists */ }
 
+        const [statusColumns] = await connection.query("SHOW COLUMNS FROM leads LIKE 'status'");
+        if (statusColumns[0]?.Type?.toLowerCase().startsWith('enum(')) {
+            const nullability = statusColumns[0].Null === 'NO' ? 'NOT NULL' : 'NULL';
+            const defaultValue = statusColumns[0].Default;
+            const defaultClause = defaultValue === null
+                ? 'DEFAULT NULL'
+                : `DEFAULT '${String(defaultValue).replace(/'/g, "''")}'`;
+            await connection.query(
+                `ALTER TABLE leads MODIFY COLUMN status VARCHAR(100) ${nullability} ${defaultClause}`
+            );
+            console.log('Migrated leads.status from ENUM to VARCHAR');
+        }
+
+        const [historyTables] = await connection.query("SHOW TABLES LIKE 'lead_edit_history'");
+        if (historyTables.length > 0) {
+            const [repairResult] = await connection.query(`
+                UPDATE leads l
+                JOIN lead_edit_history latest
+                    ON latest.lead_id = l.id
+                    AND latest.action_type = 'STATUS_UPDATE'
+                    AND latest.field_name = 'status'
+                LEFT JOIN lead_edit_history newer
+                    ON newer.lead_id = latest.lead_id
+                    AND newer.action_type = 'STATUS_UPDATE'
+                    AND newer.field_name = 'status'
+                    AND (
+                        newer.changed_at > latest.changed_at
+                        OR (newer.changed_at = latest.changed_at AND newer.id > latest.id)
+                    )
+                SET l.status = latest.new_value
+                WHERE (l.status IS NULL OR TRIM(l.status) = '')
+                    AND newer.id IS NULL
+                    AND latest.new_value IN (
+                        'New', 'Follow Up', 'Waiting for Confirmation', 'Enrolled',
+                        'Closed', 'Invalid', 'Dropped', 'Contacted', 'Confirmed',
+                        'Interested', 'Not Interested'
+                    )
+            `);
+            if (repairResult.affectedRows > 0) {
+                console.log(`Restored ${repairResult.affectedRows} blank lead statuses from edit history`);
+            }
+        }
+
         // 🚀 PERFORMANCE INDEXES: Ensure critical query columns are indexed
         const indexes = [
             "CREATE INDEX idx_leads_domain ON leads (domain(100))",
@@ -746,36 +806,37 @@ app.use((err, req, res, next) => {
 // Public Contact Enquiry (website form -> portal leads)
 app.post('/api/contact', async (req, res) => {
     try {
-        const { name, email, phone, message, businessFocus, domain, category, interested_in, passport_number } = req.body;
+        const { name, email, phone, message, businessFocus, domain, category, interested_in, passport_number, portal_signup } = req.body;
 
         if (!name || !phone || !email) {
             return res.status(400).json({ error: "Missing required fields" });
         }
-        const nowStr = getISTString();
-        // New mode: payload from master-driven contact form
-        if (domain && category && interested_in) {
-            const normalizedDomain = normalizeContactDomain(domain);
-            const leadCode = await getNextLeadCode(normalizedDomain);
-            await pool.execute(
-                `INSERT INTO leads
-                 (student_name, passport_number, email, phone, domain, source, category, interested_in, remarks, lead_code, status, is_active, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 1, ?)`,
-                [
-                    name,
-                    passport_number || null,
-                    email,
-                    phone,
-                    normalizedDomain,
-                    'Website Contact',
-                    category,
-                    interested_in,
-                    message || '',
-                    leadCode,
-                    nowStr
-                ]
+
+        if (portal_signup === true) {
+            const phoneDigits = String(phone).replace(/\D/g, '');
+            const nationalDigits = String(req.body.phone_national || phoneDigits).replace(/\D/g, '');
+            const countryDigits = String(req.body.phone_country_code || '').replace(/\D/g, '');
+            const phoneCandidates = [...new Set([
+                phoneDigits,
+                nationalDigits,
+                countryDigits + nationalDigits,
+                '00' + countryDigits + nationalDigits
+            ].filter(Boolean))];
+            const placeholders = phoneCandidates.map(() => '?').join(', ');
+            const [existingLeads] = await pool.execute(
+                `SELECT id FROM leads
+                 WHERE REGEXP_REPLACE(COALESCE(phone, ''), '[^0-9]', '') IN (${placeholders})
+                 ORDER BY id DESC
+                 LIMIT 1`,
+                phoneCandidates
             );
-            triggerEmails(name, email, phone, message, normalizedDomain, interested_in, 'Website Contact');
-            return res.json({ success: true, message: "Enquiry saved successfully" });
+            if (existingLeads.length > 0) {
+                return res.json({
+                    success: true,
+                    duplicate: true,
+                    message: 'An existing CRM record uses this mobile number. No duplicate lead was created.'
+                });
+            }
         }
         // Backward compatible mode: old businessFocus payload
         if (!businessFocus?.length) {
@@ -1224,30 +1285,30 @@ app.get('/api/dashboard/stats-bulk', authenticateToken, async (req, res) => {
                 COUNT(*) AS total_enquiry,
                 SUM(CASE WHEN status = 'Follow Up' THEN 1 ELSE 0 END) AS total_followup,
                 SUM(CASE WHEN payment_status IN ('Advance payment','Partial Payment','Full payment','No Fee') THEN 1 ELSE 0 END) AS total_enrolled,
-                SUM(CASE WHEN status = 'Dropped' THEN 1 ELSE 0 END) AS total_dropped,
+                SUM(CASE WHEN COALESCE(NULLIF(TRIM(status), ''), NULLIF(TRIM(primary_status), '')) = 'Dropped' THEN 1 ELSE 0 END) AS total_dropped,
                 SUM(CASE WHEN status = 'Waiting for Confirmation' THEN 1 ELSE 0 END) AS total_pending,
-                SUM(CASE WHEN status = 'Invalid' THEN 1 ELSE 0 END) AS total_invalid,
+                SUM(CASE WHEN COALESCE(NULLIF(TRIM(status), ''), NULLIF(TRIM(primary_status), '')) = 'Invalid' THEN 1 ELSE 0 END) AS total_invalid,
                 SUM(CASE WHEN status = 'Enrolled' AND overseas_pipeline_status != 'Document Collection' THEN 1 ELSE 0 END) AS total_processed,
                 SUM(CASE WHEN status = 'Enrolled' AND overseas_pipeline_status = 'CAS / I-20 Processing' THEN 1 ELSE 0 END) AS total_cas_team,
                 SUM(CASE WHEN status = 'Closed' AND overseas_pipeline_status = 'Completed' THEN 1 ELSE 0 END) AS total_completed,
                 SUM(CASE WHEN status = 'Contacted' THEN 1 ELSE 0 END) AS total_contacted,
                 SUM(CASE WHEN status = 'Confirmed' THEN 1 ELSE 0 END) AS total_confirmed,
                 SUM(CASE WHEN status = 'Interested' THEN 1 ELSE 0 END) AS total_interested,
-                SUM(CASE WHEN status = 'Not Interested' THEN 1 ELSE 0 END) AS total_not_interested,
+                SUM(CASE WHEN COALESCE(NULLIF(TRIM(status), ''), NULLIF(TRIM(primary_status), '')) = 'Not Interested' THEN 1 ELSE 0 END) AS total_not_interested,
                 SUM(CASE WHEN status = 'New' THEN 1 ELSE 0 END) AS total_new,
                 SUM(CASE WHEN ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_enquiry,
                 SUM(CASE WHEN status = 'Follow Up' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_followup,
                 SUM(CASE WHEN payment_status IN ('Advance payment','Partial Payment','Full payment','No Fee') AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_enrolled,
-                SUM(CASE WHEN status = 'Dropped' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_dropped,
+                SUM(CASE WHEN COALESCE(NULLIF(TRIM(status), ''), NULLIF(TRIM(primary_status), '')) = 'Dropped' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_dropped,
                 SUM(CASE WHEN status = 'Waiting for Confirmation' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_pending,
-                SUM(CASE WHEN status = 'Invalid' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_invalid,
+                SUM(CASE WHEN COALESCE(NULLIF(TRIM(status), ''), NULLIF(TRIM(primary_status), '')) = 'Invalid' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_invalid,
                 SUM(CASE WHEN status = 'Enrolled' AND overseas_pipeline_status != 'Document Collection' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_processed,
                 SUM(CASE WHEN status = 'Enrolled' AND overseas_pipeline_status = 'CAS / I-20 Processing' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_cas_team,
                 SUM(CASE WHEN status = 'Closed' AND overseas_pipeline_status = 'Completed' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_completed,
                 SUM(CASE WHEN status = 'Contacted' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_contacted,
                 SUM(CASE WHEN status = 'Confirmed' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_confirmed,
                 SUM(CASE WHEN status = 'Interested' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_interested,
-                SUM(CASE WHEN status = 'Not Interested' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_not_interested,
+                SUM(CASE WHEN COALESCE(NULLIF(TRIM(status), ''), NULLIF(TRIM(primary_status), '')) = 'Not Interested' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_not_interested,
                 SUM(CASE WHEN status = 'New' AND ${periodFrag.replace('AND ', '')} THEN 1 ELSE 0 END) AS period_new
             FROM leads
             WHERE ${where}
@@ -1419,7 +1480,7 @@ app.get('/api/dashboard/financial-leads', authenticateToken, async (req, res) =>
         const params = [];
 
         let where = `WHERE l.is_active = 1 AND l.deleted_at IS NULL`;
-        
+
         if (timeframe === 'today' || (timeframe === 'history' && date)) {
             where += ' AND DATE(l.created_at) = ?';
             params.push(date || getISTDay());
@@ -1437,7 +1498,7 @@ app.get('/api/dashboard/financial-leads', authenticateToken, async (req, res) =>
         if (domain && domain !== 'All') {
             where = appendDomainCondition(where, params, domain, 'l');
         }
-        
+
         if (payment_status && payment_status !== 'All') {
             if (payment_status === 'Pending payment') {
                 where += ` AND l.status = 'Enrolled' AND (l.payment_status = 'Pending payment' OR l.payment_status IS NULL OR l.payment_status = '' OR l.payment_status = 'Pending')`;
@@ -1456,7 +1517,7 @@ app.get('/api/dashboard/financial-leads', authenticateToken, async (req, res) =>
                 params.push(payment_status);
             }
         } else {
-             where += ` AND l.status = 'Enrolled'`;
+            where += ` AND l.status = 'Enrolled'`;
         }
 
         const countSql = `SELECT COUNT(*) as total FROM leads l ${where}`;
@@ -1504,14 +1565,14 @@ app.get('/api/dashboard/leads-filter', authenticateToken, async (req, res) => {
     const isSuperAdmin = isSuperAdminUser(req.user);
 
     try {
-        // Standardized Base Query to match Stats Cards
+        // Standardized Base Query to match Stats Cards - select updated_at as well
         const combinedBase = `
             (
-                SELECT id, student_name, email, phone, domain, source, category, interested_in, remarks, lead_code, payment_status, total_fees, paid_amount, invalid_reason, is_active, deleted_at, deleted_by, status, assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, created_at
+                SELECT id, student_name, email, phone, domain, source, category, interested_in, remarks, lead_code, payment_status, total_fees, paid_amount, invalid_reason, is_active, deleted_at, deleted_by, status, primary_status, assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, created_at, updated_at
                 FROM leads
                 WHERE is_active = 1
                 UNION ALL
-                SELECT e.id, candidate_name AS student_name, e.email, e.phone, service_type AS domain, 'Mobile App (Live)' AS source, 'Mobile Enquiry' AS category, enquiry_for AS interested_in, e.remarks, lead_code, 'Pending payment' AS payment_status, 0 AS total_fees, 0 AS paid_amount, NULL AS invalid_reason, 1 AS is_active, NULL AS deleted_at, NULL AS deleted_by, 'New' AS status, NULL AS assigned_to, NULL AS assigned_to_name, NULL AS assigned_by, NULL AS assigned_by_name, 'Mobile' AS source_type, NULL AS company_name, created_at
+                SELECT e.id, candidate_name AS student_name, e.email, e.phone, service_type AS domain, 'Mobile App (Live)' AS source, 'Mobile Enquiry' AS category, enquiry_for AS interested_in, e.remarks, lead_code, 'Pending payment' AS payment_status, 0 AS total_fees, 0 AS paid_amount, NULL AS invalid_reason, 1 AS is_active, NULL AS deleted_at, NULL AS deleted_by, 'New' AS status, NULL AS primary_status, NULL AS assigned_to, NULL AS assigned_to_name, NULL AS assigned_by, NULL AS assigned_by_name, 'Mobile' AS source_type, NULL AS company_name, created_at, created_at AS updated_at
                 FROM bgoi_enquiries e
                 WHERE NOT EXISTS (
                     SELECT 1 FROM leads l 
@@ -1570,18 +1631,21 @@ app.get('/api/dashboard/leads-filter', authenticateToken, async (req, res) => {
         }
 
         // --- 3. Timeframe filter logic ---
+        // For updated statuses, filter by updated_at date instead of created_at date
+        const dateCol = filterType === 'updated' ? 'COALESCE(updated_at, created_at)' : 'created_at';
+
         if (timeframe === 'today' || timeframe === 'history') {
             const filterDate = date || getISTDay();
-            sql += " AND DATE(created_at) = ?";
+            sql += ` AND DATE(${dateCol}) = ?`;
             params.push(filterDate);
         } else if (timeframe === 'week') {
-            sql += " AND created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)";
+            sql += ` AND ${dateCol} >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)`;
         } else if (timeframe === 'month') {
-            sql += " AND created_at >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)";
+            sql += ` AND ${dateCol} >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)`;
         } else if (timeframe === 'year') {
-            sql += " AND created_at >= DATE_SUB(CURDATE(), INTERVAL 365 DAY)";
+            sql += ` AND ${dateCol} >= DATE_SUB(CURDATE(), INTERVAL 365 DAY)`;
         } else if (timeframe === 'custom' && startDate && endDate) {
-            sql += " AND DATE(created_at) BETWEEN ? AND ?";
+            sql += ` AND DATE(${dateCol}) BETWEEN ? AND ?`;
             params.push(startDate, endDate);
         }
 
@@ -1590,13 +1654,16 @@ app.get('/api/dashboard/leads-filter', authenticateToken, async (req, res) => {
         } else if (filterType === 'pending') {
             sql += " AND status = 'Waiting for Confirmation'";
         } else if (filterType === 'updated') {
-            sql += " AND status != 'New'";
+            sql += " AND COALESCE(NULLIF(TRIM(status), ''), NULLIF(TRIM(primary_status), '')) != 'New'";
         } else if (filterType === 'invalid') {
-            sql += " AND status = 'Invalid'";
+            sql += " AND COALESCE(NULLIF(TRIM(status), ''), NULLIF(TRIM(primary_status), '')) IN ('Invalid', 'Not Interested')";
         }
 
-        sql += " ORDER BY created_at DESC";
-        if (filterType !== 'today') sql += " LIMIT 15";
+        if (filterType === 'updated') {
+            sql += " ORDER BY COALESCE(updated_at, created_at) DESC";
+        } else {
+            sql += " ORDER BY created_at DESC";
+        }
 
         const [rows] = await pool.execute(sql, params);
         res.json(rows);
@@ -1694,7 +1761,7 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
 
         // --- Apply View Filters ---
         if (view === 'invalid') {
-            where += " AND status = 'Invalid'";
+            where += " AND status = 'Not Interested'";
         } else if (view === 'waiting') {
             where += " AND status = 'Waiting for Confirmation'";
         } else if (view === 'dropped') {
@@ -1724,7 +1791,7 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
         const baseSql = `
             (
                 SELECT 
-                    id, student_name, email, phone, domain, source, category, 
+                    id, student_name, last_name, email, phone, domain, source, category, 
                     interested_in, remarks, lead_code, status, is_active, 
                     payment_status, total_fees, paid_amount,
                     assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake, created_at,
@@ -1737,6 +1804,7 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
                 SELECT 
                     e.id, 
                     COALESCE(NULLIF(e.candidate_name, ''), NULLIF(e.full_name, ''), u.name, 'Mobile User') AS student_name, 
+                    '' AS last_name,
                     e.email AS email, 
                     COALESCE(NULLIF(e.phone, ''), 'M-APP') AS phone, 
                     e.service_type AS domain, 
@@ -1909,9 +1977,12 @@ async function sendAgentNotification(agentId, leadDetails, isBulk = false, bulkC
     }
 }
 
+const appRoutes = require('./appRoutes');
+app.use('/api/app', appRoutes(pool, JWT_SECRET, getNextLeadCode, getISTString, triggerEmails));
+
 app.post('/api/leads', async (req, res) => {
-    const { 
-        student_name, email, phone, alternate_phone, domain, category, source, interested_in, remarks, 
+    const {
+        student_name, email, phone, alternate_phone, domain, category, source, interested_in, remarks,
         assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake, passport_number,
         passport_no, university_student_id, university_name, course_name, primary_status, secondary_status,
         college_contacts
@@ -2022,17 +2093,17 @@ app.put('/api/leads/:id/status', authenticateToken, async (req, res) => {
     const { status } = req.body;
     const changedBy = req.user?.name || 'System';
     try {
-        const [beforeRows] = await pool.execute('SELECT status, lead_code, domain, passport_number FROM leads WHERE id = ?', [id]);
+        const [beforeRows] = await pool.execute('SELECT status, lead_code, domain, passport_number, passport_no FROM leads WHERE id = ?', [id]);
         if (beforeRows.length === 0) return res.status(404).json({ msg: "Lead not found" });
-        
+
         const oldStatus = beforeRows[0].status;
         const leadCode = beforeRows[0].lead_code || `#${id}`;
         const domain = beforeRows[0].domain || '';
-        const passport_number = beforeRows[0].passport_number || '';
+        const passportNumber = beforeRows[0].passport_number || beforeRows[0].passport_no || '';
 
         // Validation for Overseas Enrolled
         if (status === 'Enrolled' && domain.toLowerCase().includes('overseas')) {
-            if (!passport_number || !passport_number.trim()) {
+            if (!passportNumber || !passportNumber.trim()) {
                 return res.status(400).json({ msg: "Passport number is mandatory for enrolled overseas candidates" });
             }
         }
@@ -2296,7 +2367,7 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
             (
                 SELECT 
                     id, student_name, email, phone, domain, source, category, 
-                    interested_in, remarks, lead_code, status, is_active, payment_status, 
+                    interested_in, remarks, lead_code, status, primary_status, is_active, payment_status, 
                     total_fees, paid_amount, invalid_reason,
                     assigned_to, assigned_to_name, assigned_by, assigned_by_name, source_type, company_name, intake, created_at, updated_at
                 FROM leads
@@ -2315,7 +2386,8 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
                     e.enquiry_for AS interested_in, 
                     e.remarks AS remarks, 
                     CONCAT('M-', e.id) AS lead_code, 
-                    'New' AS status, 
+                    'New' AS status,
+                    NULL AS primary_status,
                     1 AS is_active,
                     'Pending payment' AS payment_status,
                     0 AS total_fees,
@@ -2383,11 +2455,12 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
         if (status && status !== 'All') {
             const statuses = status.split(',').map(s => s.trim());
             if (statuses.length === 1) {
-                where += ' AND status = ?';
-                params.push(statuses[0]);
+                where += ' AND (status = ? OR primary_status = ?)';
+                params.push(statuses[0], statuses[0]);
             } else {
-                where += ` AND status IN (${statuses.map(() => '?').join(', ')})`;
-                params.push(...statuses);
+                const placeholders = statuses.map(() => '?').join(', ');
+                where += ` AND (status IN (${placeholders}) OR primary_status IN (${placeholders}))`;
+                params.push(...statuses, ...statuses);
             }
         }
         if (payment_status && payment_status !== 'All') {
@@ -2450,7 +2523,7 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
         } else if (view === 'payment') {
             where += ` AND payment_status IN ('Advance payment', 'Partial Payment', 'Full payment', 'No Fee')`;
         } else if (view === 'invalid') {
-            where += ` AND status = 'Invalid'`;
+            where += ` AND (status IN ('Invalid', 'Not Interested') OR primary_status IN ('Invalid', 'Not Interested'))`;
         }
 
         const countSql = `SELECT COUNT(*) AS total FROM ${combinedBase} ${where}`;
@@ -2492,26 +2565,27 @@ app.get('/api/bgi/leads', authenticateToken, async (req, res) => {
 app.put('/api/leads/remarks', authenticateToken, async (req, res) => {
     const { leadId, remarks } = req.body;
     const userName = req.user?.name || 'Staff'; // Use fallback to prevent SQL crash
+    if (!leadId || typeof remarks !== 'string') {
+        return res.status(400).json({ success: false, error: 'A lead ID and remarks text are required.' });
+    }
     try {
         const [beforeRows] = await pool.execute('SELECT remarks, lead_code FROM leads WHERE id = ?', [leadId]);
-        const oldRemarks = beforeRows[0]?.remarks || '';
-        const leadCodeRmk = beforeRows[0]?.lead_code || `#${leadId}`;
+        if (beforeRows.length === 0) {
+            return res.status(404).json({ success: false, error: 'Lead not found.' });
+        }
+        const oldRemarks = beforeRows[0].remarks || '';
+        const leadCodeRmk = beforeRows[0].lead_code || `#${leadId}`;
         const nowStr = getISTString();
-        // 1. Update the lead first (The most important part)
-        await pool.execute('UPDATE leads SET remarks = ?, updated_at = ? WHERE id = ?', [remarks || '', nowStr, leadId]);
-        // 2. Try to log history (Wrapped in its own try/catch so it doesn't break the main save)
+        await pool.execute('UPDATE leads SET remarks = ?, updated_at = ? WHERE id = ?', [remarks, nowStr, leadId]);
+        await recordLeadEditHistory(leadId, 'remarks', oldRemarks, remarks, userName, 'REMARKS_UPDATE');
+
         try {
             await pool.execute(
                 'INSERT INTO remarks_history (lead_id, old_remarks, new_remarks, changed_by, changed_at) VALUES (?, ?, ?, ?, ?)',
-                [leadId, oldRemarks, remarks || '', userName, nowStr]
-            );
-            await pool.execute(
-                `INSERT INTO lead_edit_history (lead_id, action_type, field_name, old_value, new_value, changed_by, changed_at)
-                 VALUES (?, 'REMARKS_UPDATE', 'remarks', ?, ?, ?, ?)`,
-                [leadId, oldRemarks, remarks || '', userName, nowStr]
+                [leadId, oldRemarks, remarks, userName, nowStr]
             );
         } catch (historyErr) {
-            console.error("History log failed, but remarks were saved:", historyErr.message);
+            console.error("Remarks history archive failed:", historyErr.message);
         }
 
         // ✅ SUPER ADMIN NOTIFICATION
@@ -2521,7 +2595,7 @@ app.put('/api/leads/remarks', authenticateToken, async (req, res) => {
         return res.status(200).json({
             success: true,
             msg: "Remarks updated successfully",
-            remarks: remarks
+            remarks
         });
     } catch (err) {
         console.error("Main Update Error:", err.message);
@@ -2532,15 +2606,15 @@ app.put('/api/leads/remarks', authenticateToken, async (req, res) => {
 // Update Franchise Comments
 app.put('/api/leads/franchise-comments', authenticateToken, async (req, res) => {
     const { leadId, franchise_comments } = req.body;
-    const userName = req.user?.name || 'Staff'; 
+    const userName = req.user?.name || 'Staff';
     try {
         const [beforeRows] = await pool.execute('SELECT franchise_comments, lead_code FROM leads WHERE id = ?', [leadId]);
         const oldComments = beforeRows[0]?.franchise_comments || '';
         const leadCode = beforeRows[0]?.lead_code || `#${leadId}`;
         const nowStr = getISTString();
-        
+
         await pool.execute('UPDATE leads SET franchise_comments = ?, updated_at = ? WHERE id = ?', [franchise_comments || '', nowStr, leadId]);
-        
+
         try {
             await pool.execute(
                 `INSERT INTO lead_edit_history (lead_id, action_type, field_name, old_value, new_value, changed_by, changed_at)
@@ -2909,11 +2983,11 @@ app.post('/api/leads/bulk', authenticateToken, async (req, res) => {
         // Use a loop or batch query for codes to avoid huge concurrency
         const values = [];
         const domainCounters = {}; // Cache to prevent duplicate lead codes during bulk insert
-        
+
         for (const l of uniqueLeads) {
             const prefix = getLeadCodePrefix(l.domain);
             let leadCode;
-            
+
             if (domainCounters[prefix] !== undefined) {
                 domainCounters[prefix]++;
                 leadCode = `${prefix}-${String(domainCounters[prefix]).padStart(4, '0')}`;
@@ -2922,7 +2996,7 @@ app.post('/api/leads/bulk', authenticateToken, async (req, res) => {
                 const lastNum = parseInt(String(leadCode).split('-')[1], 10);
                 domainCounters[prefix] = lastNum;
             }
-            
+
             values.push([
                 l.student_name,
                 l.email,
@@ -3051,11 +3125,12 @@ app.get('/api/leads/domain/:domainName', authenticateToken, async (req, res) => 
         if (status !== 'All') {
             const statuses = status.split(',').map(s => s.trim());
             if (statuses.length === 1) {
-                where += ' AND status = ?';
-                params.push(statuses[0]);
+                where += ' AND (status = ? OR primary_status = ?)';
+                params.push(statuses[0], statuses[0]);
             } else {
-                where += ` AND status IN (${statuses.map(() => '?').join(', ')})`;
-                params.push(...statuses);
+                const placeholders = statuses.map(() => '?').join(', ');
+                where += ` AND (status IN (${placeholders}) OR primary_status IN (${placeholders}))`;
+                params.push(...statuses, ...statuses);
             }
         }
         if (category !== 'All') {
@@ -5432,12 +5507,38 @@ app.delete('/api/media/:id', async (req, res) => {
 // ==========================================
 // 1. DOMAIN ROUTES
 // ==========================================
-// Get all domains
+// Get all sources
 app.get('/api/master/sources', authenticateToken, async (req, res) => {
     try {
-        const [rows] = await pool.query(`SELECT DISTINCT source FROM leads WHERE source IS NOT NULL AND source != '' ORDER BY source ASC`);
-        const sources = rows.map(r => r.source);
-        res.json(sources);
+        const STATIC_SOURCES = [
+            'Meta',
+            'Google',
+            'Walk in',
+            'Website',
+            'Referral',
+            'Cold Call',
+            'WhatsApp',
+            'Instagram',
+            'Campus Visit',
+            'Bulk Import',
+            'Mobile App'
+        ];
+        const [rows] = await pool.query(`SELECT DISTINCT source FROM leads WHERE source IS NOT NULL AND TRIM(source) != '' ORDER BY source ASC`);
+        const dbSources = rows.map(r => r.source.trim()).filter(Boolean);
+
+        const seen = new Set();
+        const combined = [];
+        for (const s of STATIC_SOURCES) {
+            seen.add(s.toLowerCase());
+            combined.push(s);
+        }
+        for (const s of dbSources) {
+            if (!seen.has(s.toLowerCase())) {
+                seen.add(s.toLowerCase());
+                combined.push(s);
+            }
+        }
+        res.json(combined);
     } catch (err) {
         console.error('Error fetching sources:', err);
         res.status(500).json({ error: 'Failed to fetch sources' });
@@ -6127,7 +6228,12 @@ app.post('/api/leads/:id/photo', authenticateToken, (req, res, next) => {
     if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
     try {
         const photoUrl = `uploads/photos/${req.file.filename}`;
+        const [beforeRows] = await pool.execute('SELECT candidate_photo FROM leads WHERE id = ?', [id]);
+        if (beforeRows.length === 0) {
+            return res.status(404).json({ error: 'Lead not found' });
+        }
         await pool.execute('UPDATE leads SET candidate_photo = ? WHERE id = ?', [photoUrl, id]);
+        await recordLeadEditHistory(id, 'candidate_photo', beforeRows[0].candidate_photo, photoUrl, formatWho(req.user));
         res.json({ msg: 'Photo uploaded successfully', photo_url: photoUrl });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -6139,11 +6245,15 @@ app.delete('/api/leads/:id/photo', authenticateToken, async (req, res) => {
     const { id } = req.params;
     try {
         const [rows] = await pool.execute('SELECT candidate_photo FROM leads WHERE id = ?', [id]);
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Lead not found' });
+        }
         if (rows[0]?.candidate_photo) {
             const fullPath = path.join(__dirname, rows[0].candidate_photo);
             if (fs.existsSync(fullPath)) fs.unlink(fullPath, () => {});
         }
         await pool.execute('UPDATE leads SET candidate_photo = NULL WHERE id = ?', [id]);
+        await recordLeadEditHistory(id, 'candidate_photo', rows[0].candidate_photo, null, formatWho(req.user));
         res.json({ msg: 'Photo removed' });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -6186,6 +6296,7 @@ app.post('/api/leads/:id/documents/upload', authenticateToken, uploadDocuments.s
                      WHERE id = ?`,
                     [req.file.originalname, filePath, req.file.mimetype, uploadedBy, existing[0].id]
                 );
+                await recordLeadEditHistory(id, 'documents', '', documentName || req.file.originalname, uploadedBy);
 
                 // Send email notification after update
                 try {
@@ -6212,6 +6323,7 @@ app.post('/api/leads/:id/documents/upload', authenticateToken, uploadDocuments.s
             VALUES (?, ?, ?, ?, ?, ?, 'Uploaded', ?, NOW())`,
             [id, requirementId || null, documentName, req.file.originalname, filePath, req.file.mimetype, uploadedBy]
         );
+        await recordLeadEditHistory(id, 'documents', '', documentName || req.file.originalname, uploadedBy);
 
         // Send email notification after insert
         try {
@@ -6278,6 +6390,8 @@ app.post('/api/leads/:id/documents/upload-with-mail', authenticateToken, uploadD
                 [id, null, documentName, req.file.originalname, filePath, req.file.mimetype, uploadedBy]
             );
         }
+
+        await recordLeadEditHistory(id, 'documents', '', documentName || req.file.originalname, uploadedBy);
 
         // Send email notification
         try {
@@ -6346,7 +6460,7 @@ app.post('/api/leads/:id/documents/checklist', authenticateToken, async (req, re
 
     try {
         const [existing] = await pool.execute(
-            'SELECT id, status, file_path FROM lead_documents WHERE lead_id = ? AND requirement_id = ?',
+            'SELECT id, status, file_path, document_name FROM lead_documents WHERE lead_id = ? AND requirement_id = ?',
             [id, requirementId]
         );
 
@@ -6355,6 +6469,7 @@ app.post('/api/leads/:id/documents/checklist', authenticateToken, async (req, re
             // If it has a file, we don't allow unchecking via checklist logic (must delete file).
             if (existing[0].status === 'Collected') {
                 await pool.execute('DELETE FROM lead_documents WHERE id = ?', [existing[0].id]);
+                await recordLeadEditHistory(id, 'documents', existing[0].document_name || documentName, '', uploadedBy);
                 return res.json({ msg: "Document unchecked", action: 'removed' });
             } else {
                 return res.json({ msg: "Document already uploaded", action: 'none' });
@@ -6368,6 +6483,7 @@ app.post('/api/leads/:id/documents/checklist', authenticateToken, async (req, re
             VALUES (?, ?, ?, 'Collected', ?, NOW())`,
             [id, requirementId, documentName, uploadedBy]
         );
+        await recordLeadEditHistory(id, 'documents', '', documentName, uploadedBy);
         res.json({ msg: "Document marked as Collected", action: 'added' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -6380,10 +6496,23 @@ app.patch('/api/leads/:id/documents/:docId/status', authenticateToken, async (re
         return res.status(400).json({ msg: "Invalid status" });
     }
     try {
+        const [beforeRows] = await pool.execute(
+            'SELECT status, document_name FROM lead_documents WHERE id = ? AND lead_id = ?',
+            [docId, req.params.id]
+        );
         await pool.execute(
             'UPDATE lead_documents SET status = ?, verified_by = ?, verified_at = CASE WHEN ? = "Verified" THEN NOW() ELSE verified_at END WHERE id = ?',
             [status, identifier, status, docId]
         );
+        if (beforeRows.length > 0) {
+            await recordLeadEditHistory(
+                req.params.id,
+                'documents',
+                `${beforeRows[0].document_name || 'Document'}: ${beforeRows[0].status}`,
+                `${beforeRows[0].document_name || 'Document'}: ${status}`,
+                identifier
+            );
+        }
         res.json({ msg: `Document status updated to ${status}` });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -6391,75 +6520,81 @@ app.patch('/api/leads/:id/documents/:docId/status', authenticateToken, async (re
 app.delete('/api/leads/:id/documents/:docId', authenticateToken, async (req, res) => {
     const { docId } = req.params;
     try {
-        const [rows] = await pool.execute('SELECT file_path FROM lead_documents WHERE id = ?', [docId]);
+        const [rows] = await pool.execute(
+            'SELECT file_path, document_name FROM lead_documents WHERE id = ? AND lead_id = ?',
+            [docId, req.params.id]
+        );
         if (rows.length > 0 && rows[0].file_path) {
             const fullPath = path.join(__dirname, rows[0].file_path);
             if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
         }
         await pool.execute('DELETE FROM lead_documents WHERE id = ?', [docId]);
+        if (rows.length > 0) {
+            await recordLeadEditHistory(req.params.id, 'documents', rows[0].document_name || 'Document', '', formatWho(req.user));
+        }
         res.json({ msg: "Document deleted" });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 // EDIT LEAD (UPDATE)
 app.put('/api/leads/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
-    const { 
-        student_name, email, phone, category, interested_in, intake, 
-        passport_no, university_student_id, university_name, 
-        course_name, primary_status, secondary_status,
-        college_contacts
+    const {
+        student_name, last_name, email, phone, category, interested_in, intake,
+        passport_no, university_student_id, university_name,
+        course_name, primary_status, secondary_status, remarks,
+        college_contacts, source
     } = req.body;
     try {
         const [beforeRows] = await pool.query(
-            'SELECT student_name, email, phone, category, interested_in, intake, passport_no, university_student_id, university_name, course_name, primary_status, secondary_status, college_contacts FROM leads WHERE id = ?',
+            'SELECT student_name, last_name, email, phone, category, interested_in, intake, passport_no, university_student_id, university_name, course_name, primary_status, secondary_status, remarks, college_contacts, source FROM leads WHERE id = ?',
             [id]
         );
         if (beforeRows.length === 0) {
             return res.status(404).json({ message: "Lead not found" });
         }
         const before = beforeRows[0];
-        
+
         const sql = `UPDATE leads SET 
-            student_name=?, email=?, phone=?, category=?, interested_in=?, intake=?, 
+            student_name=?, last_name=?, email=?, phone=?, category=?, interested_in=?, intake=?, 
             passport_no=?, university_student_id=?, university_name=?, 
-            course_name=?, primary_status=?, secondary_status=?, college_contacts=? 
+            course_name=?, primary_status=?, secondary_status=?, remarks=?, college_contacts=?, source=? 
             WHERE id=?`;
-            
+
         const params = [
-            student_name, email, phone, category, interested_in, intake,
-            passport_no || null, university_student_id || null, university_name || null,
-            course_name || null, primary_status || null, secondary_status || null,
-            college_contacts ? JSON.stringify(college_contacts) : null,
+            student_name !== undefined ? student_name : before.student_name,
+            last_name !== undefined ? last_name : before.last_name,
+            email !== undefined ? email : before.email,
+            phone !== undefined ? phone : before.phone,
+            category !== undefined ? category : before.category,
+            interested_in !== undefined ? interested_in : before.interested_in,
+            intake !== undefined ? intake : before.intake,
+            passport_no !== undefined ? (passport_no || null) : before.passport_no,
+            university_student_id !== undefined ? (university_student_id || null) : before.university_student_id,
+            university_name !== undefined ? (university_name || null) : before.university_name,
+            course_name !== undefined ? (course_name || null) : before.course_name,
+            primary_status !== undefined ? (primary_status || null) : before.primary_status,
+            secondary_status !== undefined ? (secondary_status || null) : before.secondary_status,
+            remarks !== undefined ? (remarks || null) : before.remarks,
+            college_contacts !== undefined ? (college_contacts ? JSON.stringify(college_contacts) : null) : before.college_contacts,
+            source !== undefined ? (source || null) : before.source,
             id
         ];
-        
+
         const [result] = await pool.query(sql, params);
         if (result.affectedRows === 0) {
             return res.status(404).json({ message: "Lead not found" });
         }
-        
+
         const changedBy = req.user?.name || 'System';
-        const historyRows = [];
         const trackFields = [
-            'student_name', 'email', 'phone', 'category', 'interested_in', 'intake',
-            'passport_no', 'university_student_id', 'university_name',
-            'course_name', 'primary_status', 'secondary_status'
+            'student_name', 'last_name', 'email', 'phone', 'category', 'interested_in',
+            'intake', 'passport_no', 'university_student_id', 'university_name',
+            'course_name', 'primary_status', 'secondary_status', 'remarks', 'college_contacts', 'source'
         ];
-        
+
         for (const field of trackFields) {
-            const oldVal = before[field] || '';
-            const newVal = req.body[field] || '';
-            if (oldVal !== newVal) {
-                historyRows.push([id, 'LEAD_EDIT', field, oldVal, newVal, changedBy]);
-            }
-        }
-        
-        for (const h of historyRows) {
-            await pool.query(
-                `INSERT INTO lead_edit_history (lead_id, action_type, field_name, old_value, new_value, changed_by)
-                 VALUES (?, ?, ?, ?, ?, ?)`,
-                h
-            );
+            const nextValue = req.body[field] !== undefined ? req.body[field] : before[field];
+            await recordLeadEditHistory(id, field, before[field], nextValue, changedBy);
         }
         res.status(200).json({ message: "Lead updated successfully" });
     } catch (err) {
@@ -7254,7 +7389,14 @@ app.get('/api/assets/:id/history', authenticateToken, async (req, res) => {
 // GET all learning countries
 app.get('/api/learning-countries', authenticateToken, async (req, res) => {
     try {
-        const [rows] = await pool.execute('SELECT * FROM learning_countries ORDER BY name ASC');
+        const isSuperAdmin = req.user.tier === 'SUPER_ADMIN' || ['Main Admin', 'MD', 'GM', 'Super Admin'].includes(req.user.role);
+        let query = 'SELECT * FROM learning_countries';
+        // Non-super-admins only see active countries
+        if (!isSuperAdmin) {
+            query += ' WHERE is_active = 1';
+        }
+        query += ' ORDER BY name ASC';
+        const [rows] = await pool.execute(query);
         res.json(rows);
     } catch (err) {
         console.error("Fetch countries error:", err);
@@ -7304,6 +7446,28 @@ app.delete('/api/learning-countries/:id', authenticateToken, async (req, res) =>
     } catch (err) {
         console.error("Delete country error:", err);
         res.status(500).json({ error: "Failed to delete country" });
+    }
+});
+
+// PATCH toggle learning country is_active (Super Admin only)
+app.patch('/api/learning-countries/:id/toggle', authenticateToken, async (req, res) => {
+    const isSuperAdmin = req.user.tier === 'SUPER_ADMIN' || ['Main Admin', 'MD', 'GM', 'Super Admin'].includes(req.user.role);
+    if (!isSuperAdmin) {
+        return res.status(403).json({ msg: "Only Super Admins can toggle country visibility." });
+    }
+
+    const { id } = req.params;
+    try {
+        // Get current state and flip it
+        const [rows] = await pool.execute('SELECT is_active FROM learning_countries WHERE id = ?', [id]);
+        if (rows.length === 0) return res.status(404).json({ msg: "Country not found" });
+
+        const newValue = rows[0].is_active === 1 ? 0 : 1;
+        await pool.execute('UPDATE learning_countries SET is_active = ? WHERE id = ?', [newValue, id]);
+        res.json({ msg: "Country visibility toggled successfully!", is_active: newValue });
+    } catch (err) {
+        console.error("Toggle country error:", err);
+        res.status(500).json({ error: "Failed to toggle country visibility" });
     }
 });
 
@@ -7693,7 +7857,7 @@ app.get('/api/overseas-pipeline', authenticateToken, async (req, res) => {
     try {
         const { role, domain: userDomain, id: loggedUserId } = req.user;
         const isSuperAdmin = isSuperAdminUser(req.user);
-        
+
         let sql = `SELECT * FROM leads WHERE is_active = 1 AND status = 'Enrolled'`;
         const params = [];
 
@@ -7708,22 +7872,22 @@ app.get('/api/overseas-pipeline', authenticateToken, async (req, res) => {
                 return res.status(403).json({ error: "Access denied. You do not have access to the Overseas domain." });
             }
         }
-        
+
         // Apply staff filter
         if (isStaffUser(req.user)) {
             sql += " AND assigned_to = ?";
             params.push(loggedUserId);
         }
-        
+
         // Apply company filter
         const loggedUserType = req.user.user_type || 'CORE';
         if (loggedUserType === 'AGENT' || loggedUserType === 'FRANCHISE') {
             sql += ' AND company_name = ?';
             params.push(req.user.company_name);
         }
-        
+
         sql += " ORDER BY created_at DESC";
-        
+
         const [rows] = await pool.execute(sql, params);
         res.json({ success: true, data: rows });
     } catch (err) {
@@ -7736,32 +7900,44 @@ app.put('/api/leads/:id/pipeline-status', authenticateToken, async (req, res) =>
     try {
         const leadId = req.params.id;
         const { status } = req.body;
-        
+
         const allowedStatuses = [
-            'Document Collection', 
-            'University Applied', 
-            'Offer Received', 
-            'CAS / I-20 Processing', 
-            'Visa Processing', 
+            'Document Collection',
+            'University Applied',
+            'Offer Received',
+            'CAS / I-20 Processing',
+            'Visa Processing',
             'Visa Approved',
             'Completed'
         ];
-        
+
         if (!allowedStatuses.includes(status)) {
             return res.status(400).json({ error: "Invalid pipeline status" });
         }
-        
+
         // Also check if user has edit permission
         if (req.user.can_edit === 0) {
             return res.status(403).json({ error: "You don't have permission to edit leads." });
         }
-        
+
         const finalStatus = status === 'Completed' ? 'Closed' : 'Enrolled';
+        const [beforeRows] = await pool.execute(
+            'SELECT status, overseas_pipeline_status FROM leads WHERE id = ?',
+            [leadId]
+        );
+        if (beforeRows.length === 0) {
+            return res.status(404).json({ error: "Lead not found" });
+        }
+        const before = beforeRows[0];
         await pool.execute(
             'UPDATE leads SET overseas_pipeline_status = ?, status = ? WHERE id = ?',
             [status, finalStatus, leadId]
         );
-        
+
+        const changedBy = req.user?.name || 'System';
+        await recordLeadEditHistory(leadId, 'overseas_pipeline_status', before.overseas_pipeline_status, status, changedBy, 'PIPELINE_UPDATE');
+        await recordLeadEditHistory(leadId, 'status', before.status, finalStatus, changedBy, 'PIPELINE_UPDATE');
+
         res.json({ success: true, message: "Pipeline status updated successfully" });
     } catch (err) {
         console.error("Pipeline Status Update Error:", err);
@@ -7775,33 +7951,38 @@ app.post('/api/leads/bulk-pipeline-status', authenticateToken, async (req, res) 
         if (!leadIds || !Array.isArray(leadIds) || leadIds.length === 0) {
             return res.status(400).json({ error: "No leads selected" });
         }
-        
+
         const allowedStatuses = [
-            'Document Collection', 
-            'University Applied', 
-            'Offer Received', 
-            'CAS / I-20 Processing', 
-            'Visa Processing', 
+            'Document Collection',
+            'University Applied',
+            'Offer Received',
+            'CAS / I-20 Processing',
+            'Visa Processing',
             'Visa Approved',
             'Completed'
         ];
-        
+
         if (!allowedStatuses.includes(status)) {
             return res.status(400).json({ error: "Invalid pipeline status" });
         }
-        
+
         // Also check if user has edit permission
         if (req.user.can_edit === 0) {
             return res.status(403).json({ error: "You don't have permission to edit leads." });
         }
-        
+
         const placeholders = leadIds.map(() => '?').join(',');
-        
+
         const finalStatus = status === 'Completed' ? 'Closed' : 'Enrolled';
+        const [beforeRows] = await pool.execute(
+            `SELECT id, status, overseas_pipeline_status, university_name, course_name, remarks
+             FROM leads WHERE id IN (${placeholders})`,
+            leadIds
+        );
 
         let updateSql = `UPDATE leads SET overseas_pipeline_status = ?, status = ?`;
         const params = [status, finalStatus];
-        
+
         if (university_name) {
             updateSql += `, university_name = ?`;
             params.push(university_name);
@@ -7814,12 +7995,34 @@ app.post('/api/leads/bulk-pipeline-status', authenticateToken, async (req, res) 
             updateSql += `, remarks = CONCAT(IFNULL(remarks, ''), '\n[Pipeline Update]: ', ?)`;
             params.push(remarks);
         }
-        
+
         updateSql += ` WHERE id IN (${placeholders})`;
         params.push(...leadIds);
-        
+
         await pool.execute(updateSql, params);
-        
+
+        const changedBy = req.user?.name || 'System';
+        for (const lead of beforeRows) {
+            await recordLeadEditHistory(lead.id, 'overseas_pipeline_status', lead.overseas_pipeline_status, status, changedBy, 'PIPELINE_UPDATE');
+            await recordLeadEditHistory(lead.id, 'status', lead.status, finalStatus, changedBy, 'PIPELINE_UPDATE');
+            if (university_name !== undefined) {
+                await recordLeadEditHistory(lead.id, 'university_name', lead.university_name, university_name, changedBy, 'PIPELINE_UPDATE');
+            }
+            if (course_name !== undefined) {
+                await recordLeadEditHistory(lead.id, 'course_name', lead.course_name, course_name, changedBy, 'PIPELINE_UPDATE');
+            }
+            if (remarks) {
+                await recordLeadEditHistory(
+                    lead.id,
+                    'remarks',
+                    lead.remarks,
+                    `${lead.remarks || ''}\n[Pipeline Update]: ${remarks}`,
+                    changedBy,
+                    'PIPELINE_UPDATE'
+                );
+            }
+        }
+
         res.json({ success: true, message: "Pipeline statuses updated successfully" });
     } catch (err) {
         console.error("Bulk Pipeline Status Update Error:", err);
